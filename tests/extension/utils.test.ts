@@ -3,10 +3,11 @@ import path from 'node:path'
 import vscode, { ExtensionContext, FileType, Uri, commands, workspace } from 'vscode'
 import { expect, vi, test, beforeEach, beforeAll, afterAll, suite } from 'vitest'
 import { ulid } from 'ulidx'
+import simpleGit from 'simple-git'
 
 import {
   getTerminalByCell,
-  getKey,
+  getKeyInfo,
   normalizeLanguage,
   getAnnotations,
   mapGitIgnoreToGlobFolders,
@@ -27,10 +28,12 @@ import {
   convertEnvList,
   asWorkspaceRelativePath,
   editJsonc,
+  getGitContext,
 } from '../../src/extension/utils'
 import { ENV_STORE, DEFAULT_ENV } from '../../src/extension/constants'
 import { CellAnnotations } from '../../src/types'
 
+vi.mock('simple-git')
 vi.mock('../../src/extension/grpc/client', () => ({}))
 vi.mock('../../../src/extension/grpc/runner/v1', () => ({
   ResolveProgramRequest_Mode: vi.fn(),
@@ -58,7 +61,7 @@ vi.mock('vscode', async () => {
       workspace: {
         getConfiguration: vi.fn(),
         workspaceFolders: [],
-        fs: mocked.workspace.fs,
+        fs: { readFile: vi.fn().mockResolvedValue({}), writeFile: vi.fn() },
       },
       env: {
         machineId: 'test-machine-id',
@@ -122,27 +125,114 @@ test('getTerminalByCell', () => {
   ).toBeUndefined()
 })
 
-test('getKey', () => {
+test('getKeyInfo', () => {
   expect(
-    getKey({
-      getText: vi.fn().mockReturnValue('foobar'),
-      languageId: 'barfoo',
-    } as any),
-  ).toBe('barfoo')
+    getKeyInfo(
+      {
+        getText: vi.fn().mockReturnValue('foobar'),
+        languageId: 'barfoo',
+      } as any,
+      {} as any,
+    ),
+  ).toStrictEqual({
+    key: 'barfoo',
+    resource: 'None',
+  })
 
   expect(
-    getKey({
-      getText: vi.fn().mockReturnValue('deployctl deploy foobar'),
-      languageId: 'something else',
-    } as any),
-  ).toBe('deno')
+    getKeyInfo(
+      {
+        getText: vi.fn().mockReturnValue('deployctl deploy foobar'),
+        languageId: 'something else',
+      } as any,
+      {} as any,
+    ),
+  ).toStrictEqual({
+    key: 'deno',
+    resource: 'URI',
+  })
 
   expect(
-    getKey({
-      getText: vi.fn().mockReturnValue(''),
-      languageId: 'shellscript',
-    } as any),
-  ).toBe('sh')
+    getKeyInfo(
+      {
+        getText: vi
+          .fn()
+          .mockReturnValue(
+            'https://github.com/stateful/vscode-runme/actions/workflows/release.yml',
+          ),
+        languageId: 'sh',
+      } as any,
+      {} as any,
+    ),
+  ).toStrictEqual({
+    key: 'github',
+    resource: 'URI',
+  })
+
+  expect(
+    getKeyInfo(
+      {
+        getText: vi
+          .fn()
+          .mockReturnValue(
+            'https://console.cloud.google.com/kubernetes/list/overview?project=runme-ci',
+          ),
+        languageId: 'sh',
+      } as any,
+      {} as any,
+    ),
+  ).toStrictEqual({
+    key: 'gcp',
+    resource: 'URI',
+  })
+
+  expect(
+    getKeyInfo(
+      {
+        getText: vi.fn().mockReturnValue(
+          // eslint-disable-next-line max-len
+          'https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#InstanceDetails:instanceId=$EC2_INSTANCE_ID',
+        ),
+        languageId: 'sh',
+      } as any,
+      {} as any,
+    ),
+  ).toStrictEqual({
+    key: 'aws',
+    resource: 'URI',
+  })
+
+  expect(
+    getKeyInfo(
+      {
+        getText: vi.fn().mockReturnValue(''),
+        languageId: 'shellscript',
+      } as any,
+      {} as any,
+    ),
+  ).toStrictEqual({
+    key: 'sh',
+    resource: 'None',
+  })
+
+  expect(
+    getKeyInfo(
+      {
+        getText: vi
+          .fn()
+          .mockReturnValue(
+            'export EC2_INSTANCE_ID=123\n' +
+              'https://us-east-1.console.aws.amazon.com/ec2/home' +
+              '?region=us-east-1#InstanceDetails:instanceId=$EC2_INSTANCE_ID',
+          ),
+        languageId: 'sh',
+      } as any,
+      {} as any,
+    ),
+  ).toStrictEqual({
+    key: 'sh',
+    resource: 'None',
+  })
 })
 
 suite('normalizeLanguage', () => {
@@ -235,7 +325,6 @@ suite('#getAnnotations', () => {
       closeTerminalOnSuccess: true,
       cwd: '',
       interactive: true,
-      mimeType: 'text/plain',
       name: 'command-123',
       category: '',
       excludeFromRunAll: false,
@@ -260,7 +349,6 @@ suite('#getAnnotations', () => {
       closeTerminalOnSuccess: true,
       cwd: '',
       interactive: true,
-      mimeType: 'text/plain',
       name: 'echo-hello',
       promptEnv: 0,
       excludeFromRunAll: false,
@@ -435,7 +523,7 @@ suite('validateAnnotations', () => {
     }
     const result = validateAnnotations(cell)
     expect(result.hasErrors).toBe(true)
-    expect(result.errors && Object.entries(result.errors).length).toBe(2)
+    expect(result.errors && Object.entries(result.errors).length).toBe(4)
   })
 
   test('it should pass for valid annotations values', () => {
@@ -684,5 +772,49 @@ suite('editJsonC', () => {
       'stateful.runme',
     )
     expect(result).toStrictEqual(expectedUpdatedJson)
+  })
+})
+
+suite('getGitContext', () => {
+  test('should return the correct git context', async () => {
+    const gitMock = {
+      branch: vi.fn().mockResolvedValue({ current: 'main' }),
+      listRemote: vi.fn().mockResolvedValue('https://github.com/user/repo.git'),
+      revparse: vi.fn().mockImplementation((params) => {
+        if (params[0] === 'HEAD') {
+          return 'commit-hash'
+        }
+        if (params[0] === '--show-prefix') {
+          return 'relative-path/'
+        }
+      }),
+    }
+
+    vi.mocked(simpleGit).mockReturnValueOnce(gitMock as unknown as ReturnType<typeof simpleGit>)
+
+    const { branch, commit, repository, relativePath } = await getGitContext('/path/to/repo')
+
+    expect(branch).toBe('main')
+    expect(commit).toBe('commit-hash')
+    expect(repository).toBe('https://github.com/user/repo.git')
+    expect(relativePath).toBe('relative-path/')
+  })
+
+  test('should return null values if there is an error', async () => {
+    const gitMock = {
+      branch: vi.fn().mockRejectedValue(new Error('branch error')),
+      listRemote: vi.fn().mockRejectedValue(new Error('listRemote error')),
+      revparse: vi.fn().mockRejectedValue(new Error('revparse error')),
+      relativePath: vi.fn().mockRejectedValue(new Error('relativePath error')),
+    }
+
+    vi.mocked(simpleGit).mockReturnValueOnce(gitMock as unknown as ReturnType<typeof simpleGit>)
+
+    const { branch, commit, repository, relativePath } = await getGitContext('/path/to/repo')
+
+    expect(branch).toBe(null)
+    expect(commit).toBe(null)
+    expect(repository).toBe(null)
+    expect(relativePath).toBe(null)
   })
 })

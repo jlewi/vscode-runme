@@ -1,4 +1,4 @@
-import { ExtensionContext, WebviewView, window, ColorThemeKind } from 'vscode'
+import { ExtensionContext, WebviewView, window, ColorThemeKind, Uri, env } from 'vscode'
 
 import { fetchStaticHtml, resolveAppToken } from '../utils'
 import { IAppToken } from '../services/runme'
@@ -72,6 +72,11 @@ export default class CloudPanel extends TanglePanel {
     let staticHtml: string
     try {
       appToken = await this.getAppToken(false).then((appToken) => appToken?.token ?? null)
+    } catch (err: any) {
+      log.error(err?.message || err)
+      appToken = null
+    }
+    try {
       staticHtml = await fetchStaticHtml(this.appUrl).then((r) => r.text())
     } catch (err: any) {
       log.error(err?.message || err)
@@ -131,6 +136,12 @@ export default class CloudPanel extends TanglePanel {
         } catch (error) {
           await window.showErrorMessage(`Failed to restore cell: ${(error as any).message}`)
         }
+      }),
+      bus.on('onSiteOpen', async (cmdEvent) => {
+        if (!cmdEvent?.url) {
+          return
+        }
+        env.openExternal(Uri.parse(cmdEvent?.url))
       }),
     ]
   }

@@ -20,6 +20,7 @@ import {
   toggleTerminal,
   copyCellToClipboard,
   runCLICommand,
+  runForkCommand,
   openAsRunmeNotebook,
   openSplitViewAsMarkdownText,
   stopBackgroundTask,
@@ -36,6 +37,7 @@ import {
   getTerminalByCell,
   getAnnotations,
   openFileAsRunmeNotebook,
+  warnBetaRequired,
 } from '../../../src/extension/utils'
 import {
   getActionsOpenViewInEditor,
@@ -50,8 +52,9 @@ vi.mock('vscode-telemetry')
 vi.mock('../../../src/extension/utils', () => ({
   getAnnotations: vi.fn(() => ({})),
   getTerminalByCell: vi.fn(),
-  replaceOutput: vi.fn(),
   openFileAsRunmeNotebook: vi.fn(),
+  replaceOutput: vi.fn(),
+  warnBetaRequired: vi.fn(),
 }))
 vi.mock('../../../src/utils/configuration', () => ({
   getActionsOpenViewInEditor: vi.fn(),
@@ -66,7 +69,7 @@ vi.mock('../../../src/extension/provider/cli', () => ({
   },
 }))
 
-vi.mock('../../../src/extension/server/runmeServer.ts', () => ({
+vi.mock('../../../src/extension/server/kernelServer.ts', () => ({
   default: class {},
 }))
 
@@ -126,10 +129,110 @@ test('copyCellToClipboard', () => {
   expect(window.showInformationMessage).toBeCalledTimes(1)
 })
 
+suite('runForkCommand', () => {
+  const mockKernel = {
+    createTerminalSession: vi.fn(),
+  } as any
+  const fakeExtensionUri = {
+    fsPath: '/path/to/extensions',
+  } as any
+
+  beforeEach(() => {
+    vi.mocked(getBinaryPath).mockClear()
+    vi.mocked(window.showInformationMessage).mockClear()
+    vi.mocked(getAnnotations).mockClear()
+    vi.mocked(window.createTerminal).mockClear()
+    vi.mocked(getCLIUseIntegratedRunme).mockClear()
+  })
+
+  test('creates new terminal', async () => {
+    const cell: any = {
+      metadata: { name: 'foobar' },
+      document: { uri: { fsPath: '/foo/bar/README.md' } },
+      kind: 2,
+    }
+
+    cell.notebook = {
+      getCells: () => [cell],
+      isDirty: false,
+    }
+
+    // Return that beta APIs are enabled
+    vi.mocked(warnBetaRequired).mockReturnValue(true)
+
+    vi.mocked(mockKernel.createTerminalSession).mockResolvedValueOnce({ data: { then: vi.fn() } })
+    await runForkCommand(mockKernel, fakeExtensionUri, false)(cell)
+    expect(vi.mocked(window.createTerminal)).toHaveBeenCalledOnce()
+  })
+
+  test('prompts user to enable beta APIs when disabled', async () => {
+    const cell: any = {
+      metadata: { name: 'foobar' },
+      document: { uri: { fsPath: '/foo/bar/README.md' } },
+      kind: 2,
+    }
+
+    cell.notebook = {
+      getCells: () => [cell],
+      isDirty: false,
+    }
+
+    // Return that beta APIs are disabled
+    vi.mocked(warnBetaRequired).mockReturnValue(false)
+
+    vi.mocked(mockKernel.createTerminalSession).mockResolvedValueOnce({ data: { then: vi.fn() } })
+    await runForkCommand(mockKernel, fakeExtensionUri, false)(cell)
+
+    expect(vi.mocked(window.createTerminal)).not.toHaveBeenCalledOnce()
+  })
+
+  test('prompts user when dirty and fails if canceled or closed', async () => {
+    const cell: any = {
+      metadata: { name: 'foobar' },
+      document: { uri: { fsPath: '/foo/bar/README.md' } },
+      kind: 2,
+    }
+
+    cell.notebook = {
+      getCells: () => [cell],
+      isDirty: true,
+      save: vi.fn(),
+    }
+
+    // Return that beta APIs are enabled
+    vi.mocked(warnBetaRequired).mockReturnValue(true)
+
+    // Cancelled
+    vi.mocked(window.showInformationMessage).mockResolvedValueOnce('Cancel' as any)
+    await runForkCommand(mockKernel, fakeExtensionUri, false)(cell)
+    expect(vi.mocked(window.createTerminal)).not.toHaveBeenCalledOnce()
+
+    vi.mocked(window.createTerminal).mockClear()
+
+    // Closed
+    vi.mocked(window.showInformationMessage).mockResolvedValueOnce(undefined as any)
+    await runForkCommand(mockKernel, fakeExtensionUri, false)(cell)
+
+    expect(vi.mocked(window.createTerminal)).not.toHaveBeenCalledOnce()
+
+    vi.mocked(window.createTerminal).mockClear()
+
+    // Saved
+    vi.mocked(mockKernel.createTerminalSession).mockResolvedValueOnce({ data: { then: vi.fn() } })
+    vi.mocked(window.showInformationMessage).mockResolvedValueOnce('Save' as any)
+    await runForkCommand(mockKernel, fakeExtensionUri, false)(cell)
+
+    expect(vi.mocked(window.createTerminal)).toHaveBeenCalledOnce()
+    expect(cell.notebook.save).toHaveBeenCalledOnce()
+  })
+})
+
 suite('runCliCommand', () => {
   beforeEach(() => {
     vi.mocked(getBinaryPath).mockClear()
     vi.mocked(window.showInformationMessage).mockClear()
+    vi.mocked(window.showNotebookDocument).mockClear()
+    vi.mocked(window.showTextDocument).mockClear()
     vi.mocked(getAnnotations).mockClear()
     vi.mocked(terminal.sendText).mockClear()
     vi.mocked(getCLIUseIntegratedRunme).mockClear()
@@ -147,7 +250,7 @@ suite('runCliCommand', () => {
       isDirty: false,
     }
 
-    await runCLICommand({} as any, false)(cell)
+    await runCLICommand({} as any, {} as any, false)(cell)
     expect(vi.mocked((terminal as any).sendText)).toHaveBeenCalledWith(
       'runme run --chdir="/foo/bar" --filename="README.md" --index=0',
     )
@@ -168,13 +271,13 @@ suite('runCliCommand', () => {
     vi.mocked(getBinaryPath).mockReturnValueOnce(Uri.file('/bin/runme'))
     vi.mocked(getCLIUseIntegratedRunme).mockReturnValueOnce(true)
 
-    await runCLICommand({} as any, false)(cell)
+    await runCLICommand({} as any, {} as any, false)(cell)
     expect(vi.mocked((terminal as any).sendText)).toHaveBeenCalledWith(
       '/bin/runme run --chdir="/foo/bar" --filename="README.md" --index=0',
     )
   })
 
-  test('prompts user when dirty and fails if cancelled or closed', async () => {
+  test('prompts user when dirty and fails if canceled or closed', async () => {
     const cell: any = {
       metadata: { name: 'foobar' },
       document: { uri: { fsPath: '/foo/bar/README.md' } },
@@ -189,14 +292,14 @@ suite('runCliCommand', () => {
 
     // Cancelled
     vi.mocked(window.showInformationMessage).mockResolvedValueOnce('Cancel' as any)
-    await runCLICommand({} as any, false)(cell)
+    await runCLICommand({} as any, {} as any, false)(cell)
     expect(vi.mocked(terminal.sendText)).not.toHaveBeenCalled()
 
     vi.mocked(terminal.sendText).mockClear()
 
     // Closed
     vi.mocked(window.showInformationMessage).mockResolvedValueOnce(undefined as any)
-    await runCLICommand({} as any, false)(cell)
+    await runCLICommand({} as any, {} as any, false)(cell)
 
     expect(vi.mocked(terminal.sendText)).not.toHaveBeenCalled()
 
@@ -204,34 +307,36 @@ suite('runCliCommand', () => {
 
     // Saved
     vi.mocked(window.showInformationMessage).mockResolvedValueOnce('Save' as any)
-    await runCLICommand({} as any, false)(cell)
+    await runCLICommand({} as any, {} as any, false)(cell)
 
     expect(vi.mocked(terminal.sendText)).toHaveBeenCalled()
     expect(cell.notebook.save).toHaveBeenCalledOnce()
   })
 })
 
-test('open markdown as Runme notebook split', (file: NotebookDocument) => {
+test('open markdown as Runme notebook split', async (file: NotebookDocument) => {
   vi.mocked(getActionsOpenViewInEditor).mockReturnValue('split' as const)
-  openAsRunmeNotebook(file)
+  vi.mocked(workspace.openNotebookDocument).mockResolvedValue(file)
+  await openAsRunmeNotebook(file.uri)
   expect(window.showNotebookDocument).toBeCalledWith(file, { viewColumn: undefined })
 })
 
-test('open Runme notebook in text editor split', (file: TextDocument) => {
+test('open Runme notebook in text editor split', async (file: TextDocument) => {
   vi.mocked(getActionsOpenViewInEditor).mockReturnValue('split' as const)
-  openSplitViewAsMarkdownText(file)
+  vi.mocked(workspace.openTextDocument).mockResolvedValue(file)
+  await openSplitViewAsMarkdownText(file.uri)
   expect(window.showTextDocument).toBeCalledWith(file, { viewColumn: ViewColumn.Beside })
 })
 
-test('open markdown as Runme notebook toggle', (file: NotebookDocument) => {
+test('open markdown as Runme notebook toggle', async (file: NotebookDocument) => {
   vi.mocked(getActionsOpenViewInEditor).mockReturnValue('toggle' as const)
-  openAsRunmeNotebook(file)
+  await openAsRunmeNotebook(file.uri)
   expect(commands.executeCommand).toBeCalledWith('workbench.action.toggleEditorType')
 })
 
-test('open Runme notebook in text editor toggle', (file: TextDocument) => {
+test('open Runme notebook in text editor toggle', async (file: TextDocument) => {
   vi.mocked(getActionsOpenViewInEditor).mockReturnValue('toggle' as const)
-  openSplitViewAsMarkdownText(file)
+  await openSplitViewAsMarkdownText(file.uri)
   expect(commands.executeCommand).toBeCalledWith('workbench.action.toggleEditorType')
 })
 
@@ -275,6 +380,9 @@ suite('askAlternativeOutputsAction', () => {
 })
 
 suite('askNewRunnerSession', () => {
+  beforeEach(() => {
+    vi.mocked(workspace.openNotebookDocument).mockClear()
+  })
   test('asks are you sure first', async () => {
     const newRunnerEnvironment = vi.fn()
     const kernel = { newRunnerEnvironment }
@@ -311,7 +419,7 @@ test('createNewRunmeNotebook', async () => {
   await createNewRunmeNotebook()
   expect(workspace.openNotebookDocument).toBeCalledWith('runme', expect.any(Object))
   expect(NotebookCellData).toBeCalledTimes(3)
-  expect(commands.executeCommand).toBeCalledWith('vscode.openWith', expect.any(String), 'runme')
+  expect(commands.executeCommand).toBeCalledWith('vscode.openWith', undefined, 'runme')
 })
 
 test('welcome command', async () => {

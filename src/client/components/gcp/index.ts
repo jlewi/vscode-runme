@@ -4,6 +4,10 @@ import { customElement, property } from 'lit/decorators.js'
 import './gke/clusters'
 import './gke/cluster'
 import './gce/vmInstances'
+import './gce/vmInstancesDetail'
+import './run/services'
+import './run/revisions'
+
 import { GCPSupportedView } from '../../../extension/resolvers/gcpResolver'
 import { GCPState } from '../../../types'
 import { RENDERERS } from '../../../constants'
@@ -51,6 +55,26 @@ export class GCPViews extends LitElement {
           cellId="${this.state.cellId}"
           projectId="${this.state.project!}"
         ></vm-instances>`
+      case GCPSupportedView.VM_INSTANCE:
+        return html`<vm-instances-detail
+          .instance="${this.state.instance!}"
+          .disks="${this.state.disks!}"
+          cellId="${this.state.cellId}"
+          projectId="${this.state.project!}"
+        ></vm-instances-detail>`
+      case GCPSupportedView.CLOUD_RUN_SERVICES:
+        return html`<gcp-run-services
+          cellId="${this.state.cellId}"
+          projectId="${this.state.project!}"
+        ></gcp-run-services>`
+      case GCPSupportedView.CLOUD_RUN_REVISIONS:
+        return html`<gcp-run-revisions
+          .revisions="${this.state.revisions!}"
+          cellId="${this.state.cellId}"
+          projectId="${this.state.project!}"
+          serviceId="${this.state.service}"
+          region="${this.state.region}"
+        ></gcp-run-revisions>`
     }
   }
 }

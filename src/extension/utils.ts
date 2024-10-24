@@ -1,5 +1,5 @@
-import path from 'node:path'
 import util from 'node:util'
+import path from 'node:path'
 import cp from 'node:child_process'
 import os from 'node:os'
 
@@ -9,6 +9,7 @@ import vscode, {
   Uri,
   workspace,
   env,
+  UIKind,
   window,
   Disposable,
   NotebookCell,
@@ -25,6 +26,7 @@ import { v5 as uuidv5 } from 'uuid'
 import getPort from 'get-port'
 import dotenv from 'dotenv'
 import { applyEdits, format, modify } from 'jsonc-parser'
+import simpleGit from 'simple-git'
 
 import {
   CellAnnotations,
@@ -32,6 +34,7 @@ import {
   NotebookAutoSaveSetting,
   RunmeTerminal,
   Serializer,
+  FeatureName,
 } from '../types'
 import { SafeCellAnnotationsSchema, CellAnnotationsSchema } from '../schema'
 import {
@@ -40,21 +43,26 @@ import {
   SERVER_ADDRESS,
   CATEGORY_SEPARATOR,
   NOTEBOOK_AUTOSAVE_ON,
-  CLOUD_USER_SIGNED_IN,
+  GITHUB_USER_SIGNED_IN,
   NOTEBOOK_OUTPUTS_MASKED,
+  NOTEBOOK_LIFECYCLE_ID,
 } from '../constants'
 import {
+  getBinaryPath,
   getEnvLoadWorkspaceFiles,
   getEnvWorkspaceFileOrder,
   getLoginPrompt,
+  getMaskOutputs,
   getNotebookAutoSave,
   getPortNumber,
+  getServerConfigurationValue,
+  getServerRunnerVersion,
   getTLSDir,
   getTLSEnabled,
-  isPlatformAuthEnabled,
-  isRunmeAppButtonsEnabled,
+  ServerLifecycleIdentity,
 } from '../utils/configuration'
 
+import features from './features'
 import CategoryQuickPickItem from './quickPickItems/category'
 import getLogger from './logger'
 import { Kernel } from './kernel'
@@ -62,9 +70,9 @@ import { BOOTFILE, BOOTFILE_DEMO } from './constants'
 import { IRunnerEnvironment } from './runner/environment'
 import { setCurrentCellExecutionDemo } from './handler/utils'
 import ContextState from './contextState'
-import { RunmeService } from './services/runme'
 import { GCPResolver } from './resolvers/gcpResolver'
 import { AWSResolver } from './resolvers/awsResolver'
+import { RunmeIdentity } from './grpc/serializerTypes'
 
 declare var globalThis: any
 
@@ -140,7 +148,9 @@ function getCellId(cell: vscode.NotebookCell): string {
     throw new Error('Cannot get cell ID for non-code cell!')
   }
 
-  return getAnnotations(cell)['runme.dev/id']!
+  const annotations = getAnnotations(cell)
+
+  return annotations['runme.dev/id'] || annotations['id'] || ''
 }
 
 export function getTerminalByCell(cell: vscode.NotebookCell): RunmeTerminal | undefined {
@@ -163,33 +173,66 @@ export function isDenoScript(runningCell: vscode.TextDocument) {
 export function isGitHubLink(runningCell: vscode.TextDocument) {
   const text = runningCell.getText()
   const isWorkflowUrl = text.includes('.github/workflows') || text.includes('actions/workflows')
-  return text.startsWith('https://github.com') && isWorkflowUrl
+  return text.trimStart().startsWith('https://github.com') && isWorkflowUrl
 }
 
-export function getKey(runningCell: vscode.TextDocument): string {
-  if (isDenoScript(runningCell)) {
-    return 'deno'
-  }
+export function isDaggerCli(text: string): boolean {
+  const simplified = text
+    .trimStart()
+    .replaceAll('\\', ' ')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => !line.startsWith('#'))
+    .flatMap((line) => line.split(' '))
+    .filter((line) => !line.startsWith('--'))
+    .join(' ')
+  return simplified.includes('dagger call')
+}
 
-  if (isGitHubLink(runningCell)) {
-    return 'github'
-  }
+export type ExecResourceType = 'None' | 'URI' | 'Dagger'
+export interface IExecKeyInfo {
+  key: string
+  resource: ExecResourceType
+}
 
-  if (new GCPResolver(runningCell).match()) {
-    return 'gcp'
-  }
+export function getKeyInfo(
+  runningCell: vscode.TextDocument,
+  annotations: CellAnnotations,
+): IExecKeyInfo {
+  try {
+    if (!annotations.background && isDaggerCli(runningCell.getText())) {
+      return { key: 'dagger', resource: 'Dagger' }
+    }
 
-  if (new AWSResolver(runningCell).match()) {
-    return 'aws'
+    if (isDenoScript(runningCell)) {
+      return { key: 'deno', resource: 'URI' }
+    }
+
+    if (isGitHubLink(runningCell)) {
+      return { key: 'github', resource: 'URI' }
+    }
+
+    if (new GCPResolver(runningCell.getText()).match()) {
+      return { key: 'gcp', resource: 'URI' }
+    }
+
+    if (new AWSResolver(runningCell.getText()).match()) {
+      return { key: 'aws', resource: 'URI' }
+    }
+  } catch (err: any) {
+    if (err?.code !== 'ERR_INVALID_URL') {
+      throw err
+    }
+    console.error(err)
   }
 
   const { languageId } = runningCell
 
   if (languageId === 'shellscript') {
-    return 'sh'
+    return { key: 'sh', resource: 'None' }
   }
 
-  return languageId
+  return { key: languageId, resource: 'None' }
 }
 
 export function normalizeLanguage(l?: string) {
@@ -514,60 +557,42 @@ export function convertEnvList(envs: string[]): Record<string, string | undefine
   )
 }
 
-export function getAuthSession(createIfNone: boolean = true) {
+export function getGithubAuthSession(createIfNone: boolean = true) {
   return authentication.getSession(AuthenticationProviders.GitHub, ['user:email'], {
     createIfNone,
   })
 }
 
-export async function getPlatformAuthSession(createIfNone: boolean = true) {
+export async function getPlatformAuthSession(createIfNone: boolean = true, silent?: boolean) {
   const scopes = ['profile', 'offline_access']
-  const options: AuthenticationGetSessionOptions = { createIfNone }
+  const options: AuthenticationGetSessionOptions = {}
+
+  if (silent !== undefined) {
+    options.silent = silent
+  } else {
+    options.createIfNone = createIfNone
+  }
 
   return await authentication.getSession(AuthenticationProviders.Stateful, scopes, options)
 }
 
 export async function resolveAuthToken(createIfNone: boolean = true) {
   let session: AuthenticationSession | undefined
-
-  if (isPlatformAuthEnabled()) {
-    session = await getPlatformAuthSession(createIfNone)
-    if (!session) {
-      throw new Error('You must authenticate with your Stateful account')
-    }
-
-    return session.accessToken
-  }
-
-  session = await getAuthSession(createIfNone)
+  session = await getPlatformAuthSession(createIfNone)
   if (!session) {
-    throw new Error('You must authenticate with your GitHub account')
+    throw new Error('You must authenticate with your Stateful account')
   }
 
-  const service = new RunmeService({ githubAccessToken: session.accessToken })
-  const response = await service.getUserToken()
-  if (!response) {
-    throw new Error('Unable to retrieve an access token')
-  }
-
-  return response.token
+  return session.accessToken
 }
 
 export async function resolveAppToken(createIfNone: boolean = true) {
-  if (isPlatformAuthEnabled()) {
+  if (features.isOnInContextState(FeatureName.RequireStatefulAuth)) {
     const session = await getPlatformAuthSession(createIfNone)
     if (!session) {
       return null
     }
     return { token: session.accessToken }
-  }
-
-  const session = await getAuthSession(createIfNone)
-
-  if (session) {
-    const service = new RunmeService({ githubAccessToken: session.accessToken })
-    const userToken = await service.getUserToken()
-    return await service.getAppToken(userToken)
   }
 
   return null
@@ -578,8 +603,9 @@ export function fetchStaticHtml(appUrl: string) {
 }
 
 export function getRunnerSessionEnvs(
-  extensionBaseUri: Uri,
+  context: ExtensionContext,
   runnerEnv: IRunnerEnvironment | undefined,
+  skipRunmePath: boolean,
   address?: string,
 ) {
   const envs: Record<string, string> = {}
@@ -588,8 +614,14 @@ export function getRunnerSessionEnvs(
     envs['RUNME_SESSION_STRATEGY'] = 'recent'
   }
 
+  if (!skipRunmePath) {
+    const binaryBasePath =
+      path.dirname(getBinaryPath(context.extensionUri).fsPath) + (isWindows() ? ';' : ':')
+    envs['PATH'] = `${binaryBasePath}${envs.PATH || process.env.PATH}`
+  }
+
   if (getTLSEnabled()) {
-    envs['RUNME_TLS_DIR'] = getTLSDir(extensionBaseUri)
+    envs['RUNME_TLS_DIR'] = getTLSDir(context.extensionUri)
   }
 
   // todo(sebastian): consider making recent vs specific session a setting
@@ -658,21 +690,23 @@ export function suggestCategories(categories: string[], title: string, placehold
 
 export async function handleNotebookAutosaveSettings() {
   const configAutoSaveSetting = getNotebookAutoSave()
-  const extensionSettingAutoSaveIsOn =
-    configAutoSaveSetting === NotebookAutoSaveSetting.Yes ? true : false
-  const notebookAutoSaveIsOn = ContextState.getKey(NOTEBOOK_AUTOSAVE_ON)
-  await ContextState.addKey(
-    NOTEBOOK_AUTOSAVE_ON,
-    notebookAutoSaveIsOn !== undefined ? notebookAutoSaveIsOn : extensionSettingAutoSaveIsOn,
-  )
+  const defaultSetting = configAutoSaveSetting === NotebookAutoSaveSetting.Yes
+  const contextSetting = ContextState.getKey(NOTEBOOK_AUTOSAVE_ON)
+
+  await ContextState.addKey(NOTEBOOK_AUTOSAVE_ON, contextSetting ?? defaultSetting)
 }
 
 export async function resetNotebookSettings() {
-  // todo(sebastian): consider adding a setting to toggle default masking
-  await ContextState.addKey(NOTEBOOK_OUTPUTS_MASKED, true)
+  await ContextState.addKey(NOTEBOOK_OUTPUTS_MASKED, getMaskOutputs())
   const configAutoSaveSetting = getNotebookAutoSave()
-  const autoSaveIsOn = configAutoSaveSetting === NotebookAutoSaveSetting.Yes ? true : false
+  const autoSaveIsOn = configAutoSaveSetting === NotebookAutoSaveSetting.Yes
   await ContextState.addKey(NOTEBOOK_AUTOSAVE_ON, autoSaveIsOn)
+
+  const current = getServerConfigurationValue<ServerLifecycleIdentity>(
+    'lifecycleIdentity',
+    RunmeIdentity.ALL,
+  )
+  await ContextState.addKey(NOTEBOOK_LIFECYCLE_ID, current)
 }
 
 export function asWorkspaceRelativePath(documentPath: string): {
@@ -686,27 +720,25 @@ export function asWorkspaceRelativePath(documentPath: string): {
   return { relativePath, outside: false }
 }
 
-export async function resolveUserSession(
-  createIfNone: boolean,
-): Promise<AuthenticationSession | undefined> {
-  return isPlatformAuthEnabled()
-    ? await getPlatformAuthSession(createIfNone)
-    : await getAuthSession(createIfNone)
-}
-
 /**
  * Handles the first time experience for saving a cell.
  * It informs the user that a Login with a GitHub account is required before prompting the user.
  * This only happens once. Subsequent saves will not display the prompt.
  * @returns AuthenticationSession
  */
-export async function promptUserSession(): Promise<AuthenticationSession | undefined> {
-  let session: AuthenticationSession | undefined = await resolveUserSession(false)
-  const displayLoginPrompt = getLoginPrompt() && isRunmeAppButtonsEnabled()
+export async function promptUserSession() {
+  const createIfNone = features.isOnInContextState(FeatureName.ForceLogin)
+  const silent = createIfNone ? undefined : true
+
+  const session = await getPlatformAuthSession(false, silent)
+
+  const displayLoginPrompt =
+    getLoginPrompt() && createIfNone && features.isOnInContextState(FeatureName.Share)
+
   if (!session && displayLoginPrompt !== false) {
     const option = await window.showInformationMessage(
       `Securely store your cell outputs.
-      Sign in with ${isPlatformAuthEnabled() ? 'Stateful' : 'GitHub'} is required, do you want to proceed?`,
+      Sign in with Stateful is required, do you want to proceed?`,
       'Yes',
       'No',
       'Open Settings',
@@ -719,19 +751,34 @@ export async function promptUserSession(): Promise<AuthenticationSession | undef
       return commands.executeCommand('runme.openSettings', 'runme.app.loginPrompt')
     }
 
-    session = await resolveUserSession(true)
-    if (!session) {
-      throw new Error('You must authenticate with your GitHub account')
-    }
-  }
+    getPlatformAuthSession(createIfNone)
+      .then((session) => {
+        if (!session) {
+          throw new Error('You must authenticate with your Stateful account')
+        }
+      })
+      .catch((error) => {
+        let message
+        if (error instanceof Error) {
+          message = error.message
+        } else {
+          message = String(error)
+        }
 
-  return session
+        // https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/browser/mainThreadAuthentication.ts#L238
+        // throw new Error('User did not consent to login.')
+        // Calling again to ensure User Menu Badge
+        if (createIfNone && message === 'User did not consent to login.') {
+          getPlatformAuthSession(false)
+        }
+      })
+  }
 }
 
 export async function checkSession(context: ExtensionContext) {
-  const session = await getAuthSession(false)
-  context.globalState.update(CLOUD_USER_SIGNED_IN, !!session)
-  ContextState.addKey(CLOUD_USER_SIGNED_IN, !!session)
+  const session = await getGithubAuthSession(false)
+  context.globalState.update(GITHUB_USER_SIGNED_IN, !!session)
+  ContextState.addKey(GITHUB_USER_SIGNED_IN, !!session)
 }
 
 export function editJsonc(
@@ -752,4 +799,92 @@ export function editJsonc(
 
 export function isValidEnvVarName(name: string): boolean {
   return new RegExp('^[A-Z_][A-Z0-9_]{1}[A-Z0-9_]*[A-Z][A-Z0-9_]*$').test(name)
+}
+
+export async function getGitContext(path: string) {
+  const filePath = path?.split('/').slice(0, -1).join('/')
+
+  try {
+    const git = simpleGit({
+      baseDir: filePath,
+    })
+
+    const branch = (await git.branch()).current
+    const repository = await git.listRemote(['--get-url', 'origin'])
+    const commit = await git.revparse(['HEAD'])
+    const relativePath = await git.revparse(['--show-prefix'])
+
+    return {
+      repository: repository.trim(),
+      branch: branch.trim(),
+      commit: commit.trim(),
+      relativePath: relativePath.trim(),
+    }
+  } catch (error) {
+    log.info('Running in a non-git context', (error as Error).message)
+
+    return {
+      repository: null,
+      branch: null,
+      commit: null,
+      relativePath: null,
+    }
+  }
+}
+
+export interface EnvProps {
+  extname: string
+  extversion: string
+  remotename: string
+  appname: string
+  product: string
+  platform: string
+  uikind: string
+}
+
+export function getEnvProps(extension: { id: string; version: string }) {
+  const extProps: EnvProps = {
+    extname: extension.id,
+    extversion: extension.version,
+    remotename: env.remoteName ?? 'none',
+    appname: env.appName,
+    product: env.appHost,
+    platform: `${os.platform()}_${os.arch()}`,
+    uikind: 'other',
+  }
+
+  switch (env.uiKind) {
+    case UIKind.Web:
+      extProps['uikind'] = 'web'
+      break
+    case UIKind.Desktop:
+      extProps['uikind'] = 'desktop'
+      break
+    default:
+      extProps['uikind'] = 'other'
+  }
+
+  return extProps
+}
+
+export function warnBetaRequired(message: string): boolean {
+  if (getServerRunnerVersion() !== 'v1') {
+    return true
+  }
+
+  const action = 'Configure Runner'
+  window
+    .showWarningMessage(
+      // eslint-disable-next-line max-len
+      `${message.length ? message + ' ' : ''}Please restart VS Code after configuration changes.`,
+      action,
+    )
+    .then((selected) => {
+      if (selected !== action) {
+        return
+      }
+      return commands.executeCommand('runme.openSettings', 'runme.server.runnerVersion')
+    })
+
+  return false
 }

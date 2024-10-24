@@ -30,8 +30,8 @@ export class Uri extends URI {
     /**
      * Allow testing against http endpoints
      */
-    if (uri.authority?.includes('.runme.dev')) {
-      return  `https://testing.runme.dev${path.join(...paths)}`
+    if (uri.authority?.includes('.stateful.com')) {
+      return  `https://testing.stateful.com${path.join(...paths)}`
     }
     return super.file(path.join(uri.fsPath, ...paths))
   })
@@ -93,6 +93,7 @@ export const window = {
   showInformationMessage: vi.fn(),
   showErrorMessage: vi.fn(),
   createTerminal: vi.fn().mockReturnValue(terminal),
+  createTextEditorDecorationType: vi.fn(),
   showNotebookDocument: vi.fn(),
   showTextDocument: vi.fn(),
   onDidChangeActiveNotebookEditor: vi.fn().mockReturnValue({ dispose: vi.fn() }),
@@ -132,7 +133,9 @@ export const env = {
   clipboard: {
     writeText: vi.fn()
   },
-  openExternal: vi.fn()
+  openExternal: vi.fn(),
+  onDidChangeTelemetryEnabled: vi.fn(),
+  isTelemetryEnabled: false,
 }
 
 export const NotebookData = vi.fn()
@@ -321,3 +324,5 @@ export enum EndOfLine {
    */
   CRLF = 2
 }
+
+export const version = '9.9.9'

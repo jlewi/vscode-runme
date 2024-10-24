@@ -10,7 +10,12 @@ AWS provides a robust Command Line Interface (CLI) that enables you to efficient
 
 You can interact with your AWS Resources with Runme via the AWS CLI or Runme Notebook Cloud renderers.
 
-💡 If you've already installed and configured the AWS CLI, feel free to jump directly to the [AWS EC2 Cloud Renderers](ec2.md) example. Otherwise, keep reading for guidance.
+💡 If you've already installed and configured the **AWS CLI**, feel free to jump directly to the available examples. Otherwise, keep reading for guidance.
+
+Available guides:
+
+- [AWS EC2 Cloud Renderers](ec2.md)
+- [AWS EKS Cloud Renderers](eks.md)
 
 ## Installing AWS CLI
 
@@ -41,12 +46,12 @@ aws configure list-profiles
 To display profile details, including access key, secret key, and region configuration information utilized for a specific profile, execute the following commands:
 
 ```sh {"id":"01HV6VWQWV48H1P32E3FBTZXQZ","promptEnv":"yes","terminalRows":"2"}
-export PROFILE_NAME="default"
-echo "PROFILE NAME SET TO $PROFILE_NAME"
+export AWS_PROFILE="stateful"
+echo "Using AWS Profile $AWS_PROFILE"
 ```
 
 ```sh {"id":"01HV6VR5P3DNBBRS24G43P384G"}
-aws configure list --profile $PROFILE_NAME
+aws configure list --profile $AWS_PROFILE
 ```
 
 ### Configuring a default profile

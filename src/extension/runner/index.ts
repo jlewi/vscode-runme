@@ -1,4 +1,3 @@
-import { DuplexStreamingCall } from '@protobuf-ts/runtime-rpc/build/types/duplex-streaming-call'
 import {
   type Pseudoterminal,
   type Event,
@@ -6,33 +5,39 @@ import {
   type TerminalDimensions,
   EventEmitter,
 } from 'vscode'
+import stripAnsi from 'strip-ansi'
 
 import type { DisposableAsync } from '../../types'
 import {
-  CommandMode,
   CreateSessionRequest,
-  ExecuteRequest,
-  ExecuteResponse,
-  ExecuteStop,
-  GetSessionRequest,
+  CreateSessionRequestImpl,
+  ExecuteRequestImpl,
+  ExecuteStopEnum,
+  GetSessionRequestImpl,
+  Winsize,
+  WinsizeImpl,
+} from '../grpc/runner/types'
+import {
+  CommandMode,
+  ExecuteRequest as ExecuteRequestType,
   ResolveProgramRequest_Mode,
   SessionEnvStoreType,
-  Winsize,
-} from '../grpc/runner/v1'
+} from '../grpc/runner/types'
+import { ExecuteDuplex } from '../grpc/runner/types'
+import { progconf } from '../grpc/runner/v2'
 import { IRunnerServiceClient, RpcError } from '../grpc/client'
 import { getSystemShellPath } from '../executors/utils'
-import { IServer } from '../server/runmeServer'
+import { IServer } from '../server/kernelServer'
 import { convertEnvList } from '../utils'
 import { getEnvWorkspaceFileOrder } from '../../utils/configuration'
 import getLogger from '../logger'
+import { XTermSerializer } from '../terminal/terminalState'
 
 import { IRunnerChild, TerminalWindowState } from './types'
 import { GrpcRunnerEnvironment, IRunnerEnvironment } from './environment'
 import { IRunnerClient, GrpcRunnerClient } from './client'
 import { GrpcRunnerProgramResolver } from './program'
 import { GrpcRunnerMonitorEnvStore } from './monitorEnv'
-
-type ExecuteDuplex = DuplexStreamingCall<ExecuteRequest, ExecuteResponse>
 
 export type RunProgramExecution =
   | {
@@ -90,6 +95,8 @@ export interface IRunner extends Disposable {
   }): Promise<IRunnerEnvironment>
 
   createProgramSession(opts: RunProgramOptions): Promise<IRunnerProgramSession>
+
+  createTerminalSession(opts: RunProgramOptions): Promise<IRunnerTerminalSession>
 
   createMonitorEnvStore(): Promise<GrpcRunnerMonitorEnvStore>
 
@@ -151,6 +158,8 @@ export interface IRunnerProgramSession extends IRunnerChild, Pseudoterminal {
 
   readonly pid: Promise<number | undefined>
 
+  readonly mimeType: Promise<string | undefined>
+
   handleInput(message: string): Promise<void>
 
   setRunOptions(opts: RunProgramOptions): void
@@ -184,6 +193,11 @@ export interface IRunnerProgramSession extends IRunnerChild, Pseudoterminal {
   ): void | Promise<void>
 }
 
+export interface IRunnerTerminalSession extends IRunnerProgramSession {
+  readonly raw: Promise<Uint8Array>
+  readonly data: Promise<string>
+}
+
 export default class GrpcRunner implements IRunner {
   protected client: IRunnerClient
 
@@ -206,6 +220,14 @@ export default class GrpcRunner implements IRunner {
 
   async createProgramSession(opts: RunProgramOptions): Promise<IRunnerProgramSession> {
     const session = new GrpcRunnerProgramSession(this.client, opts)
+
+    this.registerChild(session)
+
+    return session
+  }
+
+  async createTerminalSession(opts: RunProgramOptions): Promise<IRunnerTerminalSession> {
+    const session = new GrpcRunnerTerminalSession(this.client, opts)
 
     this.registerChild(session)
 
@@ -235,7 +257,7 @@ export default class GrpcRunner implements IRunner {
     metadata?: { [index: string]: string }
   }) {
     const envLoadOrder = getEnvWorkspaceFileOrder()
-    const request = CreateSessionRequest.create({
+    const request = CreateSessionRequestImpl().create({
       metadata,
       envs,
       project: {
@@ -249,7 +271,7 @@ export default class GrpcRunner implements IRunner {
       const client = this.client
 
       return client
-        .createSession(request)
+        .createSession(request as CreateSessionRequest)
         .then(({ response: { session } }) => {
           if (!session) {
             throw new Error('Did not receive session!!')
@@ -279,13 +301,15 @@ export default class GrpcRunner implements IRunner {
 
     const id = runnerEnv.getSessionId()
 
-    const { session } = await this.client.getSession(GetSessionRequest.create({ id })).response
+    const { session } = await this.client.getSession(GetSessionRequestImpl().create({ id }))
+      .response
 
     if (!session) {
       return undefined
     }
 
-    convertEnvList(session.envs)
+    const env = (session as any).envs ?? (session as any).env ?? []
+    convertEnvList(env)
   }
 
   // TODO: create a gRPC endpoint for this so it can be done without making a
@@ -355,6 +379,7 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
   readonly _onStdoutRaw = this.register(new EventEmitter<Uint8Array>())
   readonly _onStderrRaw = this.register(new EventEmitter<Uint8Array>())
   readonly _onPid = this.register(new EventEmitter<number | undefined>())
+  readonly _onMimeType = this.register(new EventEmitter<string | undefined>())
 
   readonly onDidWrite = this._onDidWrite.event
   readonly onDidErr = this._onDidErr.event
@@ -377,6 +402,8 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
   protected terminalWindows = new Map<TerminalWindow, TerminalWindowState>()
 
   pid = new Promise<number | undefined>(this._onPid.event)
+
+  mimeType = new Promise<string | undefined>(this._onMimeType.event)
 
   constructor(
     private readonly client: IRunnerServiceClient,
@@ -403,13 +430,20 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
     this.register(this._onDidClose.event(() => this.dispose()))
     this.register(this._onInternalErr.event(() => this.dispose()))
 
-    this.session.responses.onMessage(({ stderrData, stdoutData, exitCode, pid }) => {
+    let detectedMimeType = ''
+    this.session.responses.onMessage(({ stderrData, stdoutData, exitCode, pid, mimeType }) => {
+      if (mimeType) {
+        const mimeWithoutEncoding = mimeType.split(';')[0]
+        detectedMimeType = mimeWithoutEncoding
+        this._onMimeType.fire(mimeWithoutEncoding)
+      }
+
       if (stdoutData.length > 0) {
-        this.write('stdout', stdoutData)
+        this.write('stdout', detectedMimeType, stdoutData)
       }
 
       if (stderrData.length > 0) {
-        this.write('stderr', stderrData)
+        this.write('stderr', detectedMimeType, stderrData)
       }
 
       if (exitCode) {
@@ -418,7 +452,8 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
       }
 
       if (pid) {
-        this._onPid.fire(Number(pid.pid))
+        const v = (pid as any).pid ?? (pid as any).value
+        this._onPid.fire(Number(v))
       }
     })
 
@@ -456,8 +491,8 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
     stderr: '_onStderrRaw',
   } as const
 
-  protected write(channel: 'stdout' | 'stderr', bytes: Uint8Array): void {
-    if (this.convertEol && !this.isPseudoterminal()) {
+  protected write(channel: 'stdout' | 'stderr', mimeType: string, bytes: Uint8Array): void {
+    if (this.convertEol(mimeType) && !this.isPseudoterminal()) {
       const newBytes = new Array(bytes.byteLength)
 
       let i = 0,
@@ -523,7 +558,7 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
     const inputData = Buffer.from(data)
 
     this.session.requests.send(
-      ExecuteRequest.create({
+      ExecuteRequestImpl().create({
         inputData: inputData,
       }),
     )
@@ -626,8 +661,8 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
     }
 
     this.session.requests.send(
-      ExecuteRequest.create({
-        stop: this.isPseudoterminal() ? ExecuteStop.INTERRUPT : ExecuteStop.KILL,
+      ExecuteRequestImpl().create({
+        stop: this.isPseudoterminal() ? ExecuteStopEnum().INTERRUPT : ExecuteStopEnum().KILL,
       }),
     )
   }
@@ -669,7 +704,7 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
 
     if (this.activeTerminalWindow === terminalWindow && this.initialized) {
       await this.session.requests.send(
-        ExecuteRequest.create({
+        ExecuteRequestImpl().create({
           winsize: terminalDimensionsToWinsize(dimensions),
         }),
       )
@@ -683,6 +718,18 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
   protected register<T extends Disposable>(disposable: T): T {
     this.disposables.push(disposable)
     return disposable
+  }
+
+  protected convertEol(mimeType?: string) {
+    if (this.opts.convertEol !== undefined) {
+      return this.opts.convertEol
+    }
+
+    if (mimeType && mimeType !== 'text/plain') {
+      return false
+    }
+
+    return true
   }
 
   static runOptionsToExecuteRequest({
@@ -701,12 +748,31 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
     commandMode,
     knownId,
     knownName,
-  }: RunProgramOptions): ExecuteRequest {
+  }: RunProgramOptions): ExecuteRequestType {
     if (runnerEnv && !(runnerEnv instanceof GrpcRunnerEnvironment)) {
       throw new Error('Expected gRPC runner environment!')
     }
 
-    return ExecuteRequest.create({
+    let source: progconf.ProgramConfig['source'] | undefined = undefined
+    switch (exec?.type) {
+      case 'commands':
+        source = {
+          oneofKind: 'commands',
+          commands: { items: exec.commands },
+        }
+        break
+      case 'script':
+        source = {
+          oneofKind: 'script',
+          script: exec.script,
+        }
+        break
+      default:
+      // undefined
+    }
+
+    // attempt to satisfy both v1 and v2
+    const execReq: any = {
       arguments: args,
       envs,
       directory: cwd,
@@ -718,25 +784,79 @@ export class GrpcRunnerProgramSession implements IRunnerProgramSession {
       ...(exec?.type === 'script' && { script: exec.script }),
       ...(terminalDimensions && { winsize: terminalDimensionsToWinsize(terminalDimensions) }),
       storeLastOutput,
+      storeStdoutInEnv: storeLastOutput,
       fileExtension,
       languageId,
       commandMode,
       knownId,
       knownName,
-    })
+      // runnerv2's program config
+      config: {
+        arguments: args,
+        env: envs,
+        directory: cwd,
+        interactive: tty,
+        programName,
+        background,
+        fileExtension,
+        languageId,
+        mode: commandMode,
+        source,
+        knownId,
+        knownName,
+      },
+    }
+
+    return ExecuteRequestImpl().create(execReq) as ExecuteRequestType
   }
 
   get numTerminalWindows() {
     return this.terminalWindows.size
   }
+}
 
-  protected get convertEol() {
-    return this.opts.convertEol ?? true
+export class GrpcRunnerTerminalSession
+  extends GrpcRunnerProgramSession
+  implements IRunnerTerminalSession
+{
+  public raw: Promise<Uint8Array>
+
+  constructor(client: IRunnerServiceClient, opts: RunProgramOptions) {
+    super(client, opts)
+
+    this.raw = new Promise((resolve) => {
+      let data: Buffer = Buffer.alloc(0)
+      this.onStdoutRaw((chunk) => {
+        data = Buffer.concat([data, chunk])
+      })
+
+      this.onStderrRaw((chunk) => {
+        data = Buffer.concat([data, chunk])
+      })
+
+      this.onDidClose(() => {
+        resolve(data)
+      })
+    })
+  }
+
+  get data(): Promise<string> {
+    const term = new XTermSerializer()
+    return this.raw.then((data) => {
+      return term.write(data).then(() => {
+        const serialized = term.serialize()
+        const stripped = stripAnsi(serialized)
+
+        const outro = ' the notebook.'
+        const lastCommentIndex = stripped.lastIndexOf(outro)
+        return stripped.substring(lastCommentIndex + outro.length).trimStart()
+      })
+    })
   }
 }
 
 function terminalDimensionsToWinsize({ rows, columns }: TerminalDimensions): Winsize {
-  return Winsize.create({
+  return WinsizeImpl().create({
     cols: columns,
     rows,
   })

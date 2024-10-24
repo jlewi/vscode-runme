@@ -4,17 +4,12 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-      time: "11:00"
+      time: "06:00"
+      day: "wednesday"
+      timezone: "America/Los_Angeles"
     open-pull-requests-limit: 10
-    versioning-strategy: increase-if-necessary
+    versioning-strategy: increase
     ignore:
-      # we want to update this package manually as it changes
-      # the minimum required VS Code version for this extension
-      # to run
-      - dependency-name: "@types/vscode"
-      # we want to update this package manually as we don't have
-      # any influence which Node.js version VS Code uses
-      - dependency-name: "@types/node"
       # ESM only packages we can't update since VS Code doesn't
       # support ESM yet
       - dependency-name: "got"
@@ -23,3 +18,28 @@ updates:
       - dependency-name: "@octokit/rest"
       # it breaks wdio-vscode-service
       - dependency-name: "vscode-uri"
+      # Deprecated
+      - dependency-name: "@vercel/client"
+    groups:
+      aws-sdk:
+        patterns:
+          - "@aws-sdk/client-ec2"
+          - "@aws-sdk/client-eks"
+          - "@aws-sdk/credential-providers"
+      e2e-tests:
+        patterns:
+          - "@wdio/cli"
+          - "@wdio/local-runner"
+          - "@wdio/mocha-framework"
+          - "@wdio/spec-reporter"
+          - "chromedriver"
+          - "wdio-vscode-service"
+          - "webdriverio"
+  - package-ecosystem: npm
+    directory: "/examples/k8s"
+    schedule:
+      interval: monthly
+      time: "09:00"
+      day: "wednesday"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 1

@@ -6,22 +6,33 @@ import {
   ExtensionContext,
   tasks,
   window,
+  env,
+  Uri,
   NotebookCell,
+  authentication,
 } from 'vscode'
 import { TelemetryReporter } from 'vscode-telemetry'
 import Channel from 'tangle/webviews'
 
-import { NotebookUiEvent, Serializer, SyncSchema } from '../types'
+import { NotebookUiEvent, Serializer, SyncSchema, FeatureName } from '../types'
 import {
+  getDocsUrlFor,
   getForceNewWindowConfig,
+  getRunmeAppUrl,
+  getServerRunnerVersion,
   getSessionOutputs,
-  isPlatformAuthEnabled,
+  getServerLifecycleIdentity,
 } from '../utils/configuration'
-import { WebViews } from '../constants'
+import {
+  AuthenticationProviders,
+  NOTEBOOK_LIFECYCLE_ID,
+  TELEMETRY_EVENTS,
+  WebViews,
+} from '../constants'
 
 import { Kernel } from './kernel'
-import RunmeServer from './server/runmeServer'
-import RunmeServerError from './server/runmeServerError'
+import KernelServer from './server/kernelServer'
+import KernelServerError from './server/kernelServerError'
 import {
   ToggleTerminalProvider,
   BackgroundTaskProvider,
@@ -32,6 +43,7 @@ import {
   bootFile,
   resetNotebookSettings,
   getPlatformAuthSession,
+  getGithubAuthSession,
   openFileAsRunmeNotebook,
 } from './utils'
 import { RunmeTaskProvider } from './provider/runmeTask'
@@ -59,6 +71,8 @@ import {
   createGistCommand,
   toggleAuthorMode,
   createCellGistCommand,
+  runForkCommand,
+  selectEnvironment,
 } from './commands'
 import { WasmSerializer, GrpcSerializer, SerializerBase } from './serializer'
 import { RunmeLauncherProvider } from './provider/launcher'
@@ -68,12 +82,18 @@ import * as survey from './survey'
 import { RunmeCodeLensProvider } from './provider/codelens'
 import CloudPanel from './panels/cloud'
 import { createDemoFileRunnerForActiveNotebook, createDemoFileRunnerWatcher } from './handler/utils'
-import { CloudAuthProvider } from './provider/cloudAuth'
+import { GithubAuthProvider } from './provider/githubAuth'
 import { StatefulAuthProvider } from './provider/statefulAuth'
 import { IPanel } from './panels/base'
 import { NotebookPanel as EnvStorePanel } from './panels/notebook'
 import { NotebookCellStatusBarProvider } from './provider/cellStatusBar/notebook'
 import { SessionOutputCellStatusBarProvider } from './provider/cellStatusBar/sessionOutput'
+import { GrpcReporter } from './reporter'
+import * as manager from './ai/manager'
+import getLogger from './logger'
+import { EnvironmentManager } from './environment/manager'
+import ContextState from './contextState'
+import { RunmeIdentity } from './grpc/serializerTypes'
 
 export class RunmeExtension {
   protected serializer?: SerializerBase
@@ -83,8 +103,10 @@ export class RunmeExtension {
     const grpcSerializer = kernel.hasExperimentEnabled('grpcSerializer')
     const grpcServer = kernel.hasExperimentEnabled('grpcServer')
     const grpcRunner = kernel.hasExperimentEnabled('grpcRunner')
-    const server = new RunmeServer(
+
+    const server = new KernelServer(
       context.extensionUri,
+      kernel.envProps,
       {
         retryOnFailure: true,
         maxNumberOfIntents: 10,
@@ -104,10 +126,13 @@ export class RunmeExtension {
       RunmeExtension.registerCommand('runme.openSettings', openRunmeSettings),
     )
 
+    const reporter = new GrpcReporter(context, server)
     const serializer = grpcSerializer
       ? new GrpcSerializer(context, server, kernel)
       : new WasmSerializer(context, kernel)
     this.serializer = serializer
+    kernel.setSerializer(serializer as GrpcSerializer)
+    kernel.setReporter(reporter)
 
     const treeViewer = new RunmeLauncherProvider(getDefaultWorkspace())
     const runmeTaskProvider = tasks.registerTaskProvider(
@@ -116,18 +141,18 @@ export class RunmeExtension {
     )
 
     /**
-     * Start the Runme server
+     * Start the Kernel server
      */
     try {
       await server.launch()
     } catch (e) {
       // Unrecoverable error happened
-      if (e instanceof RunmeServerError) {
+      if (e instanceof KernelServerError) {
         TelemetryReporter.sendTelemetryErrorEvent('extension.server', { data: e.message })
-        if (server.transportType === RunmeServer.transportTypeDefault) {
+        if (server.transportType === KernelServer.transportTypeDefault) {
           return window
             .showErrorMessage(
-              `Failed to start Runme server (reason: ${e.message}).` +
+              `Failed to start Kernel server (reason: ${e.message}).` +
                 ' Consider switching from TCP to Unix Domain Socket in Settings.',
               'Open Settings',
             )
@@ -139,7 +164,7 @@ export class RunmeExtension {
             })
         }
         return window
-          .showErrorMessage(`Failed to start Runme server. Reason: ${e.message}`)
+          .showErrorMessage(`Failed to start Kernel server. Reason: ${e.message}`)
           .then((action) => {
             if (!action) {
               return
@@ -148,10 +173,16 @@ export class RunmeExtension {
       }
       TelemetryReporter.sendTelemetryErrorEvent('extension.server', { data: (e as Error).message })
       return window.showErrorMessage(
-        'Failed to start Runme server, please try to reload the window. ' +
+        'Failed to start Kernel server, please try to reload the window. ' +
           `Reason: ${(e as any).message}`,
       )
     }
+
+    // Start the AIManager. This will enable the AI services if the user has enabled them.
+    const aiManager = new manager.AIManager(kernel)
+    // We need to hang onto a reference to the AIManager so it doesn't get garbage collected until the
+    // extension is deactivated.
+    context.subscriptions.push(aiManager)
 
     const uriHandler = new RunmeUriHandler(context, kernel, getForceNewWindowConfig())
     const winCodeLensRunSurvey = new survey.SurveyWinCodeLensRun(context)
@@ -163,7 +194,8 @@ export class RunmeExtension {
     ]
     const stopBackgroundTaskProvider = new StopBackgroundTaskProvider()
 
-    const runCLI = runCLICommand(context.extensionUri, !!grpcRunner)
+    const runCLI = runCLICommand(kernel, context.extensionUri, !!grpcRunner)
+    const runFork = runForkCommand(kernel, context.extensionUri, !!grpcRunner)
 
     const codeLensProvider = new RunmeCodeLensProvider(
       context.extensionUri,
@@ -174,6 +206,7 @@ export class RunmeExtension {
       kernel,
       server,
     )
+    const environment = new EnvironmentManager(context)
 
     await resetNotebookSettings()
 
@@ -224,6 +257,7 @@ export class RunmeExtension {
       RunmeExtension.registerCommand('runme.openIntegratedTerminal', openIntegratedTerminal),
       RunmeExtension.registerCommand('runme.toggleTerminal', toggleTerminal(kernel, !!grpcRunner)),
       RunmeExtension.registerCommand('runme.runCliCommand', runCLI),
+      RunmeExtension.registerCommand('runme.runForkCommand', runFork),
       RunmeExtension.registerCommand('runme.copyCellToClipboard', copyCellToClipboard),
       RunmeExtension.registerCommand('runme.stopBackgroundTask', stopBackgroundTask),
       RunmeExtension.registerCommand(
@@ -243,7 +277,9 @@ export class RunmeExtension {
       RunmeExtension.registerCommand('runme.openRunmeFile', RunmeLauncherProvider.openFile),
       RunmeExtension.registerCommand('runme.keybinding.noop', () => {}),
       RunmeExtension.registerCommand('runme.file.openInRunme', openFileInRunme),
-      RunmeExtension.registerCommand('runme.runWithPrompts', () => runCellWithPrompts()),
+      RunmeExtension.registerCommand('runme.runWithPrompts', (cell) =>
+        runCellWithPrompts(cell, kernel),
+      ),
       runmeTaskProvider,
 
       /**
@@ -293,6 +329,7 @@ export class RunmeExtension {
       ),
       RunmeExtension.registerCommand('runme.notebookAutoSaveOn', () => toggleAutosave(false)),
       RunmeExtension.registerCommand('runme.notebookAutoSaveOff', () => toggleAutosave(true)),
+      RunmeExtension.registerCommand('runme.environments', () => selectEnvironment(environment)),
       RunmeExtension.registerCommand('runme.notebookAuthorMode', () =>
         toggleAuthorMode(false, kernel),
       ),
@@ -309,17 +346,178 @@ export class RunmeExtension {
         const outputFilePath = GrpcSerializer.getOutputsUri(notebookUri, sessionId)
         openFileAsRunmeNotebook(outputFilePath)
       }),
+
+      RunmeExtension.registerCommand('runme.lifecycleIdentityNone', () =>
+        commands.executeCommand('runme.lifecycleIdentitySelection', RunmeIdentity.UNSPECIFIED),
+      ),
+
+      RunmeExtension.registerCommand('runme.lifecycleIdentityAll', () =>
+        commands.executeCommand('runme.lifecycleIdentitySelection', RunmeIdentity.ALL),
+      ),
+
+      RunmeExtension.registerCommand('runme.lifecycleIdentityDoc', () =>
+        commands.executeCommand('runme.lifecycleIdentitySelection', RunmeIdentity.DOCUMENT),
+      ),
+
+      RunmeExtension.registerCommand('runme.lifecycleIdentityCell', () =>
+        commands.executeCommand('runme.lifecycleIdentitySelection', RunmeIdentity.CELL),
+      ),
+
+      RunmeExtension.registerCommand(
+        'runme.lifecycleIdentitySelection',
+        async (identity?: RunmeIdentity) => {
+          if (identity === undefined) {
+            window.showErrorMessage('Cannot run command without identity selection')
+            return
+          }
+
+          // skip if lifecycle identity selection didn't change
+          const current = ContextState.getKey(NOTEBOOK_LIFECYCLE_ID)
+          if (current === identity) {
+            return
+          }
+
+          await ContextState.addKey(NOTEBOOK_LIFECYCLE_ID, identity)
+
+          await Promise.all(
+            workspace.notebookDocuments.map((doc) =>
+              serializer.switchLifecycleIdentity(doc, identity),
+            ),
+          )
+        },
+      ),
+
+      RunmeExtension.registerCommand('runme.openCloudPanel', () =>
+        commands.executeCommand('workbench.view.extension.runme'),
+      ),
+
+      // Register a command to generate completions using foyle
+      RunmeExtension.registerCommand(
+        'runme.aiGenerate',
+        aiManager.completionGenerator.generateCompletion,
+      ),
     )
 
-    if (isPlatformAuthEnabled()) {
-      context.subscriptions.push(new StatefulAuthProvider(context, uriHandler))
-      // Required to populate the Accounts Menu in the Activity Bar
-      getPlatformAuthSession(false)
-    } else {
-      context.subscriptions.push(new CloudAuthProvider(context))
-    }
+    TelemetryReporter.sendTelemetryEvent('config', { runnerVersion: getServerRunnerVersion() })
 
     await bootFile(context)
+
+    if (
+      kernel.hasExperimentEnabled('shellWarning', false) &&
+      context.globalState.get<boolean>(TELEMETRY_EVENTS.ShellWarning, true)
+    ) {
+      const showUnsupportedShellMessage = async () => {
+        const learnMore = 'Learn more'
+        const dontAskAgain = "Don't ask again"
+
+        TelemetryReporter.sendTelemetryEvent(TELEMETRY_EVENTS.ShellWarning)
+
+        const answer = await window.showWarningMessage(
+          'Your current shell has limited or no support.' +
+            ' Please consider switching to sh, bash, or zsh.' +
+            ' Click "Learn more" for additional resources.',
+          learnMore,
+          dontAskAgain,
+        )
+        if (answer === learnMore) {
+          const url = getDocsUrlFor('/r/extension/unsupported-shell')
+          env.openExternal(Uri.parse(url))
+        } else if (answer === dontAskAgain) {
+          await context.globalState.update(TELEMETRY_EVENTS.ShellWarning, false)
+        }
+      }
+
+      const logger = getLogger('runme.experiments.shellWarning')
+
+      kernel
+        .runProgram('echo $SHELL')
+        .then((output) => {
+          if (output === false) {
+            return
+          }
+
+          const supportedShells = ['bash', 'zsh']
+          const isSupported = supportedShells.some((sh) => output?.includes(sh))
+          logger.info(`Shell: ${output}`)
+
+          if (!isSupported) {
+            showUnsupportedShellMessage()
+          }
+        })
+        .catch((e) => {
+          logger.error(e)
+          showUnsupportedShellMessage()
+        })
+    }
+
+    if (kernel.isFeatureOn(FeatureName.RequireStatefulAuth)) {
+      const forceLogin = kernel.isFeatureOn(FeatureName.ForceLogin)
+      context.subscriptions.push(new StatefulAuthProvider(context, uriHandler))
+      const silent = forceLogin ? undefined : true
+
+      getPlatformAuthSession(forceLogin, silent)
+        .then((session) => {
+          if (session) {
+            const openDashboardStr = 'Open Dashboard'
+            window
+              .showInformationMessage('Logged into the Stateful Platform', openDashboardStr)
+              .then((answer) => {
+                if (answer === openDashboardStr) {
+                  const dashboardUri = getRunmeAppUrl(['app'])
+                  const uri = Uri.parse(dashboardUri)
+                  env.openExternal(uri)
+                }
+              })
+          }
+        })
+        .catch((error) => {
+          let message
+          if (error instanceof Error) {
+            message = error.message
+          } else {
+            message = String(error)
+          }
+
+          // https://github.com/microsoft/vscode/blob/main/src/vs/workbench/api/browser/mainThreadAuthentication.ts#L238
+          // throw new Error('User did not consent to login.')
+          // Calling again to ensure User Menu Badge
+          if (forceLogin && message === 'User did not consent to login.') {
+            getPlatformAuthSession(false)
+          }
+        })
+    }
+
+    if (kernel.isFeatureOn(FeatureName.Gist)) {
+      context.subscriptions.push(new GithubAuthProvider(context))
+      getGithubAuthSession(false).then((session) => {
+        kernel.updateFeatureContext('githubAuth', !!session)
+      })
+    }
+
+    authentication.onDidChangeSessions((e) => {
+      if (
+        kernel.isFeatureOn(FeatureName.RequireStatefulAuth) &&
+        e.provider.id === AuthenticationProviders.Stateful
+      ) {
+        getPlatformAuthSession(false, true).then(async (session) => {
+          if (!!session) {
+            await commands.executeCommand('runme.lifecycleIdentitySelection', RunmeIdentity.ALL)
+          } else {
+            const settingsDefault = getServerLifecycleIdentity()
+            await commands.executeCommand('runme.lifecycleIdentitySelection', settingsDefault)
+          }
+          kernel.updateFeatureContext('statefulAuth', !!session)
+        })
+      }
+      if (
+        kernel.isFeatureOn(FeatureName.Gist) &&
+        e.provider.id === AuthenticationProviders.GitHub
+      ) {
+        getGithubAuthSession(false).then((session) => {
+          kernel.updateFeatureContext('githubAuth', !!session)
+        })
+      }
+    })
   }
 
   protected handleMasking(kernel: Kernel, maskingIsOn: boolean): (e: NotebookUiEvent) => void {

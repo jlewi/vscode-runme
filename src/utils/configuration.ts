@@ -4,10 +4,10 @@ import path from 'node:path'
 import { ExtensionContext, NotebookCell, Uri, workspace } from 'vscode'
 import { z } from 'zod'
 
-import { SERVER_PORT } from '../constants'
+import { RUNME_FRONTMATTER_PARSED, SERVER_PORT } from '../constants'
 import { RunmeIdentity } from '../extension/grpc/serializerTypes'
 import { getAnnotations, isWindows } from '../extension/utils'
-import { NotebookAutoSaveSetting } from '../types'
+import { NotebookAutoSaveSetting, Serializer } from '../types'
 
 const ACTIONS_SECTION_NAME = 'runme.actions'
 const SERVER_SECTION_NAME = 'runme.server'
@@ -20,9 +20,10 @@ const APP_SECTION_NAME = 'runme.app'
 
 export const OpenViewInEditorAction = z.enum(['split', 'toggle'])
 const DEFAULT_WORKSPACE_FILE_ORDER = ['.env.local', '.env']
-const DEFAULT_RUNME_APP_API_URL = 'https://api.runme.dev'
-const DEFAULT_RUNME_BASE_DOMAIN = 'runme.dev'
-const DEFAULT_RUNME_REMOTE_DEV = 'staging.runme.dev'
+const DEFAULT_RUNME_APP_API_URL = 'https://platform.stateful.com'
+const DEFAULT_RUNME_BASE_DOMAIN = 'platform.stateful.com'
+const DEFAULT_RUNME_REMOTE_DEV = 'staging.platform.stateful.com'
+const DEFAULT_DOCS_URL = 'https://docs.runme.dev'
 const APP_LOOPBACKS = ['127.0.0.1', 'localhost']
 const APP_LOOPBACK_MAPPING = new Map<string, string>([
   ['api.', ':4000'],
@@ -62,6 +63,7 @@ const configurationSchema = {
     tlsDir: z.string().optional(),
     transportType: z.enum(['TCP', 'UDS']).default('TCP'),
     lifecycleIdentity: z.nativeEnum(RunmeIdentity).default(RunmeIdentity.CELL),
+    runnerVersion: z.enum(['v1', 'v2']).default('v1'),
   },
   codelens: {
     enable: z.boolean().default(true),
@@ -80,14 +82,15 @@ const configurationSchema = {
   app: {
     apiUrl: z.string().default(DEFAULT_RUNME_APP_API_URL),
     baseDomain: z.string().default(DEFAULT_RUNME_BASE_DOMAIN),
-    enableShare: z.boolean().default(true),
     forceNewWindow: z.boolean().default(true),
     notebookAutoSave: z
       .enum([NotebookAutoSaveSetting.Yes, NotebookAutoSaveSetting.No])
       .default(NotebookAutoSaveSetting.No),
     sessionOutputs: z.boolean().default(true),
+    maskOutputs: z.boolean().default(true),
     loginPrompt: z.boolean().default(true),
     platformAuth: z.boolean().default(false),
+    docsUrl: z.string().default(DEFAULT_DOCS_URL),
   },
 }
 
@@ -95,6 +98,7 @@ const notebookTerminalSchemaObject = z.object(notebookTerminalSchema)
 export type TerminalConfiguration = z.infer<typeof notebookTerminalSchemaObject>
 export type ServerTransportType = z.infer<typeof configurationSchema.server.transportType>
 export type ServerLifecycleIdentity = z.infer<typeof configurationSchema.server.lifecycleIdentity>
+export type ServerRunnerVersion = z.infer<typeof configurationSchema.server.runnerVersion>
 
 const getActionsConfigurationValue = <T>(
   configName: keyof typeof configurationSchema.actions,
@@ -206,6 +210,13 @@ const getPortNumber = (): number => {
   return SERVER_PORT
 }
 
+const getServerLifecycleIdentity = (): ServerLifecycleIdentity => {
+  return getServerConfigurationValue<ServerLifecycleIdentity>(
+    'lifecycleIdentity',
+    RunmeIdentity.UNSPECIFIED,
+  )
+}
+
 const getCustomServerAddress = (): string | undefined => {
   return getServerConfigurationValue<string | undefined>('customAddress', undefined)
 }
@@ -247,22 +258,35 @@ const enableServerLogs = (): boolean => {
   return getServerConfigurationValue<boolean>('enableLogger', false)
 }
 
+const getServerRunnerVersion = (): ServerRunnerVersion => {
+  return getServerConfigurationValue<ServerRunnerVersion>('runnerVersion', 'v1')
+}
+
 const isNotebookTerminalFeatureEnabled = (
   featureName: keyof typeof notebookTerminalSchema,
 ): boolean => {
   return getRunmeTerminalConfigurationValue(featureName, false)
 }
 
-const getNotebookTerminalConfigurations = () => {
+const getNotebookTerminalConfigurations = (metadata: Serializer.Metadata) => {
   const schema = z.object(notebookTerminalSchema)
   const keys = Object.keys(notebookTerminalSchema) as Array<keyof typeof notebookTerminalSchema>
-  return keys.reduce(
+  const config = keys.reduce(
     (p, c) => {
       p[c] = getRunmeTerminalConfigurationValue<never>(c, undefined as never)
       return p
     },
     {} as z.infer<typeof schema>,
   )
+  const parsedFm = metadata?.[RUNME_FRONTMATTER_PARSED]
+  if (parsedFm?.terminalRows) {
+    const rows = Number(parsedFm.terminalRows)
+    if (!Number.isFinite(rows)) {
+      return config
+    }
+    config.rows = rows
+  }
+  return config
 }
 
 const isNotebookTerminalEnabledForCell = (cell: NotebookCell): boolean => {
@@ -295,6 +319,7 @@ const registerExtensionEnvVarsMutation = (
   context: ExtensionContext,
   envs: Record<string, string>,
 ): void => {
+  context.environmentVariableCollection.persistent = false
   const binaryBasePath =
     path.dirname(getBinaryPath(context.extensionUri).fsPath) + (isWindows() ? ';' : ':')
   context.environmentVariableCollection.prepend('PATH', binaryBasePath)
@@ -347,7 +372,7 @@ const getRunmeAppUrl = (subdomains: string[]): string => {
   }
   const isLoopback = APP_LOOPBACKS.map((host) => base.includes(host)).reduce((p, c) => p || c)
 
-  if (!isLoopback && isPlatformAuthEnabled()) {
+  if (!isLoopback) {
     subdomains = subdomains.map((s) => {
       if (s === 'app') {
         return ''
@@ -381,10 +406,6 @@ const getRunmeBaseDomain = (): string => {
   return baseDomain
 }
 
-const isRunmeAppButtonsEnabled = (): boolean => {
-  return getCloudConfigurationValue('enableShare', true)
-}
-
 const getRunmePanelIdentifier = (identifer: string): string => {
   const configurationSection = workspace.getConfiguration(`${APP_SECTION_NAME}.panel`)
   const configurationValue = configurationSection.get<string>(identifer) || identifer
@@ -403,6 +424,10 @@ const getSessionOutputs = (): boolean => {
   return getCloudConfigurationValue('sessionOutputs', true)
 }
 
+const getMaskOutputs = (): boolean => {
+  return getCloudConfigurationValue('maskOutputs', true)
+}
+
 const getLoginPrompt = (): boolean => {
   return getCloudConfigurationValue('loginPrompt', true)
 }
@@ -411,16 +436,27 @@ const isPlatformAuthEnabled = (): boolean => {
   return getCloudConfigurationValue('platformAuth', false)
 }
 
+const getDocsUrl = (): string => {
+  return getCloudConfigurationValue('docsUrl', DEFAULT_DOCS_URL)
+}
+
+const getDocsUrlFor = (path: string): string => {
+  const baseUrl = getDocsUrl()
+  return `${baseUrl}${path}`
+}
+
 export {
   enableServerLogs,
   getActionsOpenViewInEditor,
   getBinaryPath,
+  getServerRunnerVersion,
   getCLIUseIntegratedRunme,
   getCloseTerminalOnSuccess,
   getCodeLensEnabled,
   getCodeLensPasteIntoTerminalNewline,
   getNotebookExecutionOrder,
   getCustomServerAddress,
+  getServerLifecycleIdentity,
   getEnvLoadWorkspaceFiles,
   getEnvWorkspaceFileOrder,
   getForceNewWindowConfig,
@@ -434,9 +470,11 @@ export {
   getTLSEnabled,
   isNotebookTerminalEnabledForCell,
   isNotebookTerminalFeatureEnabled,
-  isRunmeAppButtonsEnabled,
   isPlatformAuthEnabled,
   registerExtensionEnvVarsMutation,
   getSessionOutputs,
+  getMaskOutputs,
   getLoginPrompt,
+  getDocsUrlFor,
+  getDocsUrl,
 }

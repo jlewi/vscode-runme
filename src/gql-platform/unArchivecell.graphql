@@ -1,0 +1,7 @@
+mutation UnArchiveCellOutput(
+    $id: String!
+) {
+    unArchiveCellOutput(id: $id) {
+        id
+    }
+}

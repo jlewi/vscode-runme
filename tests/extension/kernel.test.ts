@@ -7,21 +7,39 @@ import { TelemetryReporter } from '../../__mocks__/vscode-telemetry'
 import { ClientMessages } from '../../src/constants'
 import { APIMethod } from '../../src/types'
 import * as platform from '../../src/extension/messages/platformRequest/saveCellExecution'
-import * as cloudApi from '../../src/extension/messages/cloudApiRequest/saveCellExecution'
 import { isPlatformAuthEnabled } from '../../src/utils/configuration'
 import { askAlternativeOutputsAction } from '../../src/extension/commands'
+import { getEventReporter } from '../../src/extension/ai/events'
+
+const reportExecution = vi.fn()
 
 vi.mock('vscode')
 vi.mock('vscode-telemetry')
+vi.mock('../../src/extension/ai/events', async () => {
+  return {
+    getEventReporter: () => ({
+      reportExecution,
+    }),
+  }
+})
 vi.mock('../../src/extension/utils', async () => {
   return {
-    getKey: vi.fn((cell) => cell.languageId),
+    getKeyInfo: vi.fn((cell) => ({ key: cell.languageId, uriResource: false })),
     getAnnotations: vi.fn((cell) => cell.metadata),
     getNotebookCategories: vi.fn().mockResolvedValue([]),
     isWindows: () => false,
     isShellLanguage: () => false,
-    getAuthSession: vi.fn().mockResolvedValue({
+    getGithubAuthSession: vi.fn().mockResolvedValue({
       accessToken: '123',
+    }),
+    getEnvProps: vi.fn().mockReturnValue({
+      extname: 'stateful.runme',
+      extversion: '1.2.3-foo.1',
+      remotename: 'none',
+      appname: 'Visual Studio Code',
+      product: 'desktop',
+      platform: 'darwin_arm64',
+      uikind: 'desktop',
     }),
   }
 })
@@ -40,7 +58,6 @@ vi.mock('../../src/extension/runner', () => ({}))
 vi.mock('../../src/extension/grpc/runner/v1', () => ({}))
 vi.mock('../../src/extension/commands', () => ({ askAlternativeOutputsAction: vi.fn() }))
 vi.mock('../../src/extension/messages/platformRequest/saveCellExecution')
-vi.mock('../../src/extension/messages/cloudApiRequest/saveCellExecution')
 vi.mock('../../../../src/extension/services/runme', () => ({
   RunmeService: class {
     async getUserToken() {}
@@ -97,33 +114,16 @@ suite('#handleRendererMessage', () => {
     })
   })
 
-  test(ClientMessages.cloudApiRequest, async () => {
-    message = {
-      ...message,
-      type: ClientMessages.cloudApiRequest,
-    }
-    const messaging = notebooks.createRendererMessaging('foo')
-    const requestMessage: cloudApi.APIRequestMessage = {
-      messaging: messaging,
-      message,
-      editor,
-    }
-
-    new Kernel({} as any)
-    await messaging.postMessage(requestMessage)
-    expect(cloudApi.default).toBeCalledTimes(1)
-  })
-
   test('isPlatformAuthEnabled', async () => {
     vi.mocked(platform.default).mockClear()
     vi.mocked(isPlatformAuthEnabled).mockReturnValue(true)
 
     message = {
       ...message,
-      type: ClientMessages.cloudApiRequest,
+      type: ClientMessages.platformApiRequest,
     }
     const messaging = notebooks.createRendererMessaging('foo')
-    const requestMessage: cloudApi.APIRequestMessage = {
+    const requestMessage: platform.APIRequestMessage = {
       messaging: messaging,
       message,
       editor,
@@ -344,6 +344,7 @@ suite('_doExecuteCell', () => {
   beforeEach(() => {
     vi.mocked(workspace.openTextDocument).mockReset()
     vi.mocked(TelemetryReporter.sendTelemetryEvent).mockClear()
+    vi.mocked(reportExecution).mockClear()
   })
 
   test('calls proper executor if present', async () => {
@@ -355,6 +356,9 @@ suite('_doExecuteCell', () => {
       underlyingExecution: vi.fn(),
     })
     k.getCellOutputs = vi.fn().mockResolvedValue({})
+    k.openAndWaitForTextDocument = vi
+      .fn()
+      .mockImplementation(() => ({ languageId: 'foobar', getText: () => 'foobar cell' }))
 
     vi.mocked(workspace.openTextDocument).mockResolvedValueOnce({
       languageId: 'foobar',
@@ -366,6 +370,7 @@ suite('_doExecuteCell', () => {
     } as any)
     // @ts-expect-error mocked out
     expect(executors.foobar).toBeCalledTimes(1)
+    expect(getEventReporter().reportExecution).toBeCalledTimes(1)
     expect(TelemetryReporter.sendTelemetryEvent).toHaveBeenCalledWith('cell.startExecute')
     expect(TelemetryReporter.sendTelemetryEvent).toHaveBeenCalledWith('cell.endExecute', {
       'cell.success': undefined,
@@ -383,6 +388,10 @@ suite('_doExecuteCell', () => {
       underlyingExecution: vi.fn(),
     })
     k.getCellOutputs = vi.fn().mockResolvedValue({})
+    k.openAndWaitForTextDocument = vi
+      .fn()
+      // languageId makes sure no executor is found
+      .mockImplementation(() => ({ languageId: undefined, getText: () => 'foobar cell' }))
 
     vi.mocked(workspace.openTextDocument).mockResolvedValueOnce({
       languageId: 'barfoo',
@@ -396,8 +405,11 @@ suite('_doExecuteCell', () => {
           mimeType: 'text/plain',
         },
       } as any)
-    } catch (e) {}
+    } catch (e) {
+      console.error(e)
+    }
 
+    expect(getEventReporter().reportExecution).toBeCalledTimes(1)
     expect(TelemetryReporter.sendTelemetryEvent).toHaveBeenCalledWith('cell.startExecute')
     expect(TelemetryReporter.sendTelemetryEvent).toHaveBeenCalledWith('cell.endExecute', {
       'cell.success': 'false',
@@ -410,4 +422,20 @@ test('supportedLanguages', async () => {
   const k = new Kernel({} as any)
 
   expect(k.getSupportedLanguages()![0]).toStrictEqual('shellscript')
+})
+
+test('#envProps', async () => {
+  const k = new Kernel({
+    extension: { id: 'stateful.runme', packageJSON: { version: '1.2.3-rc.0' } },
+  } as any)
+
+  expect(k.envProps).toStrictEqual({
+    appname: 'Visual Studio Code',
+    extname: 'stateful.runme',
+    extversion: '1.2.3-foo.1',
+    platform: 'darwin_arm64',
+    product: 'desktop',
+    remotename: 'none',
+    uikind: 'desktop',
+  })
 })

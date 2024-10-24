@@ -1,0 +1,65 @@
+name: SonarCloud
+on:
+  workflow_dispatch:
+
+# cancel old edit events being processed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xvfb
+        run: sudo apt-get update -y && sudo apt-get install xvfb
+      - name: 👷 Install Dependencies
+        run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 🧪 Setup and Test with Runme
+        run: xvfb-run npx runme run configureNPM setup build test:ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNME_TEST_TOKEN: ${{ secrets.RUNME_TEST_TOKEN }}
+          RUNME_PROJECT: ${{ github.workspace }}
+          SHELL: bash
+          GITHUB_ACTOR: ${{ github.actor }}
+      - name: 🔼 Upload Artifacts
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: screenshots
+          path: |
+            tests/e2e/screenshots
+            tests/e2e/logs
+      - name: 🔼 Upload coverage
+        uses: actions/upload-artifact@v4
+        if: ${{github.actor != 'dependabot[bot]' && matrix.os == 'ubuntu-latest'}}
+        with:
+          name: coverage
+          path: ./coverage
+          if-no-files-found: error
+
+  sonarcloud:
+    if: ${{github.actor != 'dependabot[bot]' && vars.EXTENSION_NAME == 'runme'}}
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Retrieve saved coverage
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: coverage
+          path: ./coverage
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Needed to get PR information, if any
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

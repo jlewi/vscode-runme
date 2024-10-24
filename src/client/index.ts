@@ -1,4 +1,4 @@
-import type { ActivationFunction, RendererContext } from 'vscode-notebook-renderer'
+import type { ActivationFunction } from 'vscode-notebook-renderer'
 
 import { OutputType, RENDERERS } from '../constants'
 import type { CellOutput } from '../types'
@@ -13,7 +13,7 @@ import './components'
 // rendering logic inside of the `render()` function.
 // ----------------------------------------------------------------------------
 
-export const activate: ActivationFunction = (context: RendererContext<void>) => {
+export const activate: ActivationFunction<void> = (context) => {
   setContext(context)
   return {
     renderOutputItem(outputItem, element) {
@@ -29,6 +29,30 @@ export const activate: ActivationFunction = (context: RendererContext<void>) => 
           const vercelElem = document.createElement(RENDERERS.VercelOutput)
           vercelElem.setAttribute('content', JSON.stringify(payload.output))
           element.appendChild(vercelElem)
+          break
+        case OutputType.dagger:
+          // if (payload.output?.error) {
+          //   renderError(payload.output.error)
+          //   break
+          // }
+          if (!payload.output?.cellId) {
+            return
+          }
+
+          const daggerElem = document.createElement(RENDERERS.DaggerCli)
+          daggerElem.setAttribute('cellId', payload.output.cellId)
+
+          const outputState = {
+            ...payload.output,
+            ...{
+              cli: {
+                status: 'active',
+              },
+            },
+          }
+          daggerElem.setAttribute('state', JSON.stringify(outputState))
+
+          element.appendChild(daggerElem)
           break
         case OutputType.deno:
           if (payload.output?.error) {
@@ -66,6 +90,7 @@ export const activate: ActivationFunction = (context: RendererContext<void>) => 
             'validationErrors',
             JSON.stringify(payload.output.validationErrors ?? []),
           )
+          annoElem.setAttribute('settings', JSON.stringify(payload.output.settings))
           element.appendChild(annoElem)
           break
         case OutputType.terminal:
@@ -96,12 +121,6 @@ export const activate: ActivationFunction = (context: RendererContext<void>) => 
           if (typeof payload.output.scrollback === 'number') {
             terminalElement.setAttribute('scrollback', payload.output.scrollback.toString())
           }
-          if (payload.output.enableShareButton) {
-            terminalElement.setAttribute(
-              'enableShareButton',
-              payload.output.enableShareButton.toString(),
-            )
-          }
           if (payload.output.initialRows !== undefined) {
             terminalElement.setAttribute('initialRows', payload.output.initialRows.toString())
           }
@@ -110,11 +129,29 @@ export const activate: ActivationFunction = (context: RendererContext<void>) => 
             terminalElement.setAttribute('initialContent', payload.output.content)
           }
 
-          if (payload.output.isAutoSaveEnabled && payload.output.enableShareButton) {
+          if (payload.output.isAutoSaveEnabled) {
             terminalElement.setAttribute(
               'isAutoSaveEnabled',
               payload.output.isAutoSaveEnabled.toString(),
             )
+          }
+
+          if (payload.output.isSessionOutputsEnabled) {
+            terminalElement.setAttribute(
+              'isSessionOutputsEnabled',
+              payload.output.isSessionOutputsEnabled.toString(),
+            )
+          }
+
+          if (payload.output.isPlatformAuthEnabled) {
+            terminalElement.setAttribute(
+              'isPlatformAuthEnabled',
+              payload.output.isPlatformAuthEnabled.toString(),
+            )
+          }
+
+          if (payload.output.isDaggerOutput) {
+            terminalElement.setAttribute('isDaggerOutput', payload.output.isDaggerOutput.toString())
           }
 
           element.appendChild(terminalElement)

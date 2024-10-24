@@ -2,7 +2,12 @@ import { LitElement, html } from 'lit'
 import { customElement, property } from 'lit/decorators.js'
 import { when } from 'lit/directives/when.js'
 
-import type { ClientMessage, CellAnnotations, CellAnnotationsErrorResult } from '../../../types'
+import type {
+  ClientMessage,
+  CellAnnotations,
+  CellAnnotationsErrorResult,
+  Settings,
+} from '../../../types'
 import { CellAnnotationsSchema, AnnotationSchema } from '../../../schema'
 import {
   ClientMessages,
@@ -58,19 +63,19 @@ export class Annotations extends LitElement {
       description: 'Prompt user input for exported environment variables.',
     },
     mimeType: {
-      description: "Cell's output content MIME type.",
+      description: "Cell's output MIME type (non-interactive); skips auto-detection.",
     },
     name: {
-      description: 'Cell name or environment variable name to export the cell output (see docs)',
+      description: 'Cell name or environment variable name to export the cell output (see docs).',
     },
     cwd: {
       description: 'Optionally run the cell in different working directory (cwd).',
     },
     interpreter: {
-      description: 'Inserted into shebang (aka #!) line',
+      description: 'Inserted into shebang (aka #!) line.',
     },
     category: {
-      description: 'Execute this code cell within a category. (no comma or spaces allowed)',
+      description: 'Execute this code cell within a tag (no comma or spaces allowed).',
     },
     excludeFromRunAll: {
       description: 'Prevent executing this cell during the "Run All" operation.',
@@ -89,6 +94,9 @@ export class Annotations extends LitElement {
 
   @property({ type: Array })
   categories: string[] = []
+
+  @property({ type: Object })
+  settings: Settings = {}
 
   #getTargetValue(e: Target) {
     switch (e.target.type) {
@@ -228,7 +236,7 @@ export class Annotations extends LitElement {
   }
 
   renderDocsLink(id: string) {
-    const link = `https://docs.runme.dev/r/extension/${id}`
+    const link = `${this.settings?.docsUrl}/r/extension/${id}`
     return html`<vscode-link href="${link}">(docs ${ExternalLinkIcon})</vscode-link>`
   }
 
@@ -291,13 +299,14 @@ export class Annotations extends LitElement {
       <div>
         <category-selector
           categories="${this.categories}"
-          createNewCategoryText="Add ${id}"
-          selectCategoryText="Select ${id}"
+          createNewCategoryText="Add tag"
+          selectCategoryText="Select tag"
           selectedCategory="${value!}"
           description="${details.description}"
           identifier="${id}"
           @onChange=${this.onCategorySelectorChange}
           @onCreateNewCategory=${this.createNewCategoryClick}
+          @settings=${this.settings}
         ></category-selector>
       </div>
     </div>`
@@ -316,9 +325,9 @@ export class Annotations extends LitElement {
     const ctx = getContext()
     ctx.postMessage &&
       postClientMessage(ctx, ClientMessages.displayPrompt, {
-        placeholder: 'Category name',
+        placeholder: 'Tag name',
         isSecret: false,
-        title: 'New cell execution category',
+        title: 'New cell execution tag',
         id: this.getCellId(),
       })
   }

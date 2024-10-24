@@ -5,6 +5,7 @@ import type { TextField } from '@vscode/webview-ui-toolkit'
 
 import { ExternalLinkIcon } from '../icons/external'
 import { CATEGORY_SEPARATOR } from '../../../constants'
+import { Settings } from '../../../types'
 
 export interface ISelectedCategory {
   name: string
@@ -31,7 +32,7 @@ export class CategoryItem extends LitElement {
       margin: 3px 0 2px;
     }
     .item-container:not(.editMode):hover {
-      background-color: #2a2d2e;
+      background-color: var(--theme-input-background);
     }
     .item-container pre {
       margin: 0;
@@ -102,7 +103,7 @@ export class CategoryItem extends LitElement {
           class="action-item"
           style="padding: 0 2px 0 0"
           role="presentation"
-          title="Edit Category Item"
+          title="Edit Tag Item"
         >
           <vscode-button appearance="primary" @click="${this.#onCategoryNameChange}">
             <label>OK</label>
@@ -112,7 +113,7 @@ export class CategoryItem extends LitElement {
           class="action-item"
           style="padding: 0 0 0px 2px"
           role="presentation"
-          title="Remove Category Item"
+          title="Remove Tag Item"
         >
           <vscode-button
             appearance="secondary"
@@ -132,11 +133,11 @@ export class CategoryItem extends LitElement {
     return html`<div class="item-container">
       <pre>${this.category}</pre>
       <ul class="actions-container" role="toolbar">
-        <li class="action-item" role="presentation" title="Edit Category Item">
+        <li class="action-item" role="presentation" title="Edit Tag Item">
           <a
             class="action-label codicon codicon-settings-edit"
             role="button"
-            aria-label="Edit Category Item"
+            aria-label="Edit Tag Item"
             aria-checked=""
             tabindex="0"
             @click="${() => {
@@ -157,11 +158,11 @@ export class CategoryItem extends LitElement {
             </svg>
           </a>
         </li>
-        <li class="action-item" role="presentation" title="Remove Category Item">
+        <li class="action-item" role="presentation" title="Remove TAg Item">
           <a
             class="action-label codicon codicon-settings-remove"
             role="button"
-            aria-label="Remove Category Item"
+            aria-label="Remove Tag Item"
             aria-checked=""
             @click="${() => {
               const event = new CustomEvent('onCategoryRemoved', {
@@ -302,6 +303,9 @@ export class CategorySelector extends LitElement {
   @property()
   identifier: string | undefined
 
+  @property({ type: Object })
+  settings: Settings = {}
+
   private dispatchComponentEvent(name: string, e: Event) {
     if (e.defaultPrevented) {
       e.preventDefault()
@@ -334,7 +338,8 @@ export class CategorySelector extends LitElement {
   }
 
   renderLink() {
-    return html`<vscode-link href="https://docs.runme.dev/configuration#run-all-cells-by-category"
+    return html`<vscode-link
+      href="${this.settings?.docsUrl}/configuration#run-all-cells-by-category"
       >(docs ${ExternalLinkIcon})</vscode-link
     >`
   }
@@ -342,7 +347,7 @@ export class CategorySelector extends LitElement {
   render() {
     return html`
       <div class="flex-column themeText">
-        <div style="font-weight:600;">${this.identifier} ${this.renderLink()}</div>
+        <div style="font-weight:600;">tag ${this.renderLink()}</div>
         <div style="font-weight:300;">${this.description}</div>
 
         <div class="categories">

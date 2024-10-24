@@ -121,7 +121,7 @@ suite('AnnotationSchema', () => {
         expect(background).toBeFalsy()
         expect(closeTerminalOnSuccess).toBeTruthy()
         expect(interactive).toBeTruthy()
-        expect(mimeType).toStrictEqual('text/plain')
+        expect(mimeType).toBeUndefined()
         expect(name).toBe('')
       }
     })
@@ -137,7 +137,11 @@ suite('AnnotationSchema', () => {
       const parseResult = CellAnnotationsSchema.safeParse(input) as SafeParseError<any>
       expect(parseResult.success).toBeFalsy()
       const { fieldErrors } = parseResult.error.flatten()
-      expect(fieldErrors).toEqual({ background: ['expected a boolean value'] })
+      expect(fieldErrors).toEqual({
+        background: ['expected a boolean value'],
+        interactive: ['expected a boolean value'],
+        closeTerminalOnSuccess: ['expected a boolean value'],
+      })
     })
 
     test('Should generate safe default values', () => {
@@ -148,7 +152,7 @@ suite('AnnotationSchema', () => {
         expect(background).toBeFalsy()
         expect(closeTerminalOnSuccess).toBeTruthy()
         expect(interactive).toBeTruthy()
-        expect(mimeType).toStrictEqual('text/plain')
+        expect(mimeType).toBeUndefined()
         expect(name).toBe('')
       }
     })

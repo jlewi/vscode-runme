@@ -14,9 +14,8 @@ import { Subject, debounceTime } from 'rxjs'
 import { RpcError } from '@protobuf-ts/runtime-rpc'
 
 import getLogger from '../../logger'
-import { ClientMessages, NOTEBOOK_RUN_WITH_PROMPTS } from '../../../constants'
+import { ClientMessages, NOTEBOOK_RUN_WITH_PROMPTS, OutputType } from '../../../constants'
 import { ClientMessage } from '../../../types'
-import { PLATFORM_OS } from '../../constants'
 import {
   IRunner,
   IRunnerProgramSession,
@@ -28,37 +27,38 @@ import { getAnnotations, getCellRunmeId, getTerminalByCell } from '../../utils'
 import { postClientMessage } from '../../../utils/messaging'
 import {
   getCloseTerminalOnSuccess,
+  getServerRunnerVersion,
   isNotebookTerminalEnabledForCell,
 } from '../../../utils/configuration'
 import { ITerminalState } from '../../terminal/terminalState'
 import { toggleTerminal } from '../../commands'
-import {
-  CommandMode,
-  ResolveProgramRequest_Mode,
-  ResolveProgramResponse_Status,
-  ResolveProgramResponse_VarResult,
-} from '../../grpc/runner/v1'
 import { closeTerminalByEnvID } from '../task'
 import {
   getCellProgram,
   getNotebookSkipPromptEnvSetting,
-  getCmdShellSeq,
   isShellLanguage,
-  // getCommandExportExtractMatches,
   promptUserForVariable,
 } from '../utils'
-import { handleVercelDeployOutput, isVercelDeployScript } from '../vercel'
 import { IKernelExecutorOptions } from '..'
 import ContextState from '../../contextState'
+import {
+  CommandMode,
+  CommandModeEnum,
+  ResolveProgramResponse_VarResult,
+  ResolveProgramRequest_Mode,
+  ResolveProgramRequest_ModeEnum,
+  ResolveProgramResponse_StatusEnum,
+} from '../../grpc/runner/types'
 
 import { createRunProgramOptions } from './factory'
 
 const log = getLogger('executeRunner')
 const LABEL_LIMIT = 15
 const BACKGROUND_TASK_HIDE_TIMEOUT = 2000
-const MIME_TYPES_WITH_CUSTOM_RENDERERS = ['text/plain']
+const CELL_MIME_TYPE_DEFAULT: string = 'text/plain' as const
+const MIME_TYPES_WITH_CUSTOM_RENDERERS = [CELL_MIME_TYPE_DEFAULT]
 
-interface IKernelRunnerOptions extends IKernelExecutorOptions {
+export interface IKernelRunnerOptions extends IKernelExecutorOptions {
   runner: IRunner
   runningCell: TextDocument
   cellId: string
@@ -66,9 +66,7 @@ interface IKernelRunnerOptions extends IKernelExecutorOptions {
   runnerEnv?: IRunnerEnvironment
 }
 
-type IKernelRunner = (executor: IKernelRunnerOptions) => Promise<boolean>
-
-type VarResult = ResolveProgramResponse_VarResult
+export type IKernelRunner = (executor: IKernelRunnerOptions) => Promise<boolean>
 
 export const executeRunner: IKernelRunner = async ({
   kernel,
@@ -81,10 +79,15 @@ export const executeRunner: IKernelRunner = async ({
   execKey,
   outputs,
   runnerEnv,
-  envMgr,
+  runScript,
 }: IKernelRunnerOptions) => {
-  const { interactive, mimeType, background, closeTerminalOnSuccess } = getAnnotations(exec.cell)
-  // enforce background tasks as singleton instanes
+  const {
+    interactive,
+    mimeType: cellMimeType,
+    background,
+    closeTerminalOnSuccess,
+  } = getAnnotations(exec.cell)
+  // enforce background tasks as singleton instances
   // to do this,
   if (background) {
     const terminal = getTerminalByCell(exec.cell)
@@ -101,14 +104,15 @@ export const executeRunner: IKernelRunner = async ({
 
   let programOptions: RunProgramOptions
   try {
-    const isVercel = isVercelDeployScript(runningCell.getText())
-    const resolveRunProgram = isVercel ? resolveProgramOptionsVercel : resolveProgramOptionsScript
+    // removed vercel resolution option
+    const resolveRunProgram = resolveProgramOptionsScript
     programOptions = await resolveRunProgram({
       exec,
       execKey,
       runnerEnv,
       runningCell,
       runner,
+      cellId,
     })
   } catch (err) {
     if (err instanceof RpcError && err.methodName === 'ResolveProgram') {
@@ -189,7 +193,6 @@ export const executeRunner: IKernelRunner = async ({
     postClientMessage(messaging, ClientMessages.onProgramClose, {
       'runme.dev/id': cellId,
       code,
-      escalationButton: kernel.hasExperimentEnabled('escalationButton', false)!,
     })
     if (!background) {
       return
@@ -206,6 +209,8 @@ export const executeRunner: IKernelRunner = async ({
     writeToTerminalStdout(`\x1B[7m * \x1B[0m ${text}`)
   })
 
+  program.onDidWrite(writeToTerminalStdout)
+
   if (interactive) {
     program.registerTerminalWindow('vscode')
     await program.setActiveTerminalWindow('vscode')
@@ -213,22 +218,22 @@ export const executeRunner: IKernelRunner = async ({
 
   let revealNotebookTerminal = isNotebookTerminalEnabledForCell(exec.cell)
 
-  const mime = mimeType || ('text/plain' as const)
-
   terminalState = await kernel.registerCellTerminalState(
     exec.cell,
     revealNotebookTerminal ? 'xterm' : 'local',
   )
 
-  const cellText = runningCell.getText()
-  const scriptVercel = getCmdShellSeq(cellText, PLATFORM_OS)
-  if (MIME_TYPES_WITH_CUSTOM_RENDERERS.includes(mime) && !isVercelDeployScript(scriptVercel)) {
+  let mimeType = cellMimeType
+  if (interactive) {
     if (revealNotebookTerminal) {
       program.registerTerminalWindow('notebook')
       await program.setActiveTerminalWindow('notebook')
     }
 
-    program.onDidWrite(writeToTerminalStdout)
+    const t = OutputType[execKey as keyof typeof OutputType]
+    if (t) {
+      outputs.showOutput(t)
+    }
 
     await outputs.showTerminal()
   } else {
@@ -237,41 +242,25 @@ export const executeRunner: IKernelRunner = async ({
 
     // adapted from `shellExecutor` in `shell.ts`
     const _handleOutput = async (data: Uint8Array) => {
+      mimeType = mimeType || (await program.mimeType) || CELL_MIME_TYPE_DEFAULT
       output.push(Buffer.from(data))
-
-      let item: NotebookCellOutputItem | undefined = new NotebookCellOutputItem(
-        Buffer.concat(output),
-        mime,
-      )
-
-      // hacky for now, maybe inheritence is a fitting pattern
-      const isVercelProd = process.env['vercelProd'] === 'true'
-      if (isVercelDeployScript(scriptVercel)) {
-        await handleVercelDeployOutput(
-          exec.cell,
-          outputs,
-          output,
-          exec.cell.index,
-          isVercelProd,
-          envMgr,
-        )
-
-        item = undefined
-      } else if (MIME_TYPES_WITH_CUSTOM_RENDERERS.includes(mime)) {
-        await outputs.showTerminal()
-        item = undefined
+      if (MIME_TYPES_WITH_CUSTOM_RENDERERS.includes(mimeType)) {
+        outputItems$.complete()
+        return
       }
 
-      if (item) {
-        outputItems$.next(item)
-      }
+      const item = new NotebookCellOutputItem(Buffer.concat(output), mimeType)
+      outputItems$.next(item)
     }
 
     // debounce by 0.5s because human preception likely isn't as fast
-    const sub = outputItems$
-      .pipe(debounceTime(500))
-      .subscribe((item) => outputs.replaceOutputs([new NotebookCellOutput([item])]))
-
+    const sub = outputItems$.pipe(debounceTime(500)).subscribe({
+      next: (item) => outputs.replaceOutputs([new NotebookCellOutput([item])]),
+      complete: async () => {
+        const isCustomRenderer = MIME_TYPES_WITH_CUSTOM_RENDERERS.includes(mimeType || '')
+        return isCustomRenderer && (await outputs.showTerminal())
+      },
+    })
     context.subscriptions.push({ dispose: () => sub.unsubscribe() })
 
     program.onStdoutRaw(_handleOutput)
@@ -286,6 +275,7 @@ export const executeRunner: IKernelRunner = async ({
   } else {
     await outputs.replaceOutputs([])
 
+    const cellText = runningCell.getText()
     const RUNME_ID = getCellRunmeId(exec.cell)
     const taskExecution = new Task(
       { type: 'shell', name: `Runme Task (${RUNME_ID})` },
@@ -381,7 +371,7 @@ export const executeRunner: IKernelRunner = async ({
     await program.run()
   }
 
-  return await new Promise<boolean>(async (resolve, reject) => {
+  const main = await new Promise<boolean>(async (resolve, reject) => {
     const terminalState = outputs.getCellTerminalState()
     program.onDidClose(async (code) => {
       const pid = await program.pid
@@ -426,13 +416,20 @@ export const executeRunner: IKernelRunner = async ({
       }, BACKGROUND_TASK_HIDE_TIMEOUT)
     }
   })
+
+  let secondary = true
+  if (runScript) {
+    secondary = await runScript()
+  }
+
+  return main && secondary
 }
 
-type IResolveRunProgram = (resovler: IResolveRunProgramOptions) => Promise<RunProgramOptions>
+type IResolveRunProgram = (resolver: IResolveRunProgramOptions) => Promise<RunProgramOptions>
 
 type IResolveRunProgramOptions = { runner: IRunner } & Pick<
   IKernelRunnerOptions,
-  'exec' | 'execKey' | 'runnerEnv' | 'runningCell'
+  'exec' | 'execKey' | 'runnerEnv' | 'runningCell' | 'cellId'
 >
 
 export const resolveProgramOptionsScript: IResolveRunProgram = async ({
@@ -441,22 +438,33 @@ export const resolveProgramOptionsScript: IResolveRunProgram = async ({
   exec,
   execKey,
   runningCell,
+  cellId,
 }: IResolveRunProgramOptions): Promise<RunProgramOptions> => {
   const { promptEnv } = getAnnotations(exec.cell)
   const forceInputPrompt = ContextState.getKey(NOTEBOOK_RUN_WITH_PROMPTS)
-  const script = exec.cell.document.getText()
+  let script = exec.cell.document.getText()
+
+  // temp hack for dagger integration
+  if (execKey === 'dagger' && !script.includes(' --help')) {
+    const varName = `DAGGER_${cellId}`
+    script = 'export ' + varName + '=$(' + script + '\n)'
+  }
+
+  const { PROMPT_ALL, SKIP_ALL } = ResolveProgramRequest_ModeEnum()
 
   // Document level settings
   const skipPromptEnvDocumentLevel = getNotebookSkipPromptEnvSetting(exec.cell.notebook)
   const promptMode = forceInputPrompt
-    ? ResolveProgramRequest_Mode.PROMPT_ALL
+    ? PROMPT_ALL
     : skipPromptEnvDocumentLevel === false
       ? promptEnv
-      : ResolveProgramRequest_Mode.SKIP_ALL
+      : SKIP_ALL
 
   const RUNME_ID = getCellRunmeId(exec.cell)
+  const RUNME_RUNNER = getServerRunnerVersion()
   const envs: Record<string, string> = {
     RUNME_ID,
+    RUNME_RUNNER,
   }
 
   const { commandMode } = getCellProgram(exec.cell, exec.cell.notebook, execKey)
@@ -473,30 +481,6 @@ export const resolveProgramOptionsScript: IResolveRunProgram = async ({
   return createRunProgramOptions(execKey, runningCell, exec, execution, runnerEnv)
 }
 
-export const resolveProgramOptionsVercel: IResolveRunProgram = async ({
-  runnerEnv,
-  exec,
-  execKey,
-  runningCell,
-}: IResolveRunProgramOptions): Promise<RunProgramOptions> => {
-  const script = runningCell.getText()
-
-  const scriptVercel = getCmdShellSeq(script, PLATFORM_OS)
-  const isVercelProd = process.env['vercelProd'] === 'true'
-  const parts = [scriptVercel]
-  if (isVercelProd) {
-    parts.push('--prod')
-  }
-  const commands = [parts.join(' ')]
-
-  const execution: RunProgramExecution = {
-    type: 'commands',
-    commands,
-  }
-
-  return createRunProgramOptions(execKey, runningCell, exec, execution, runnerEnv)
-}
-
 /**
  * Prompts for vars that are exported as necessary
  */
@@ -509,7 +493,8 @@ export async function resolveRunProgramExecution(
   commandMode: CommandMode,
   promptMode: ResolveProgramRequest_Mode,
 ): Promise<RunProgramExecution> {
-  if (commandMode !== CommandMode.INLINE_SHELL) {
+  const { INLINE_SHELL } = CommandModeEnum()
+  if (commandMode !== INLINE_SHELL) {
     return {
       type: 'script',
       script,
@@ -519,14 +504,17 @@ export async function resolveRunProgramExecution(
   const resolver = await runner.createProgramResolver(promptMode, envs)
   // todo(sebastian): removing $-prompts from shell scripts should move kernel-side
   const rawCommands = prepareCommandSeq(script, languageId)
-  const result = await resolver.resolveProgram(rawCommands, runnerEnv?.getSessionId())
+  const result = await resolver.resolveProgram(rawCommands, languageId, runnerEnv?.getSessionId())
   const vars = result.response.vars
 
   // todo(sebastian): once normalization is all kernel-side, it should return commands
   script = result.response.script ?? script
 
   // const commands = await parseCommandSeq(script, languageId, exportMatches, skipEnvs)
-  const promptReducer = async (acc: Promise<CommandBlock[]>, current: VarResult) => {
+  const promptReducer = async (
+    acc: Promise<CommandBlock[]>,
+    current: ResolveProgramResponse_VarResult,
+  ) => {
     return promptVariablesAsync(await acc, current)
   }
 
@@ -562,23 +550,25 @@ type CommandBlock =
 
 export async function promptVariablesAsync(
   blocks: CommandBlock[],
-  variable: VarResult,
+  variable: ResolveProgramResponse_VarResult,
 ): Promise<CommandBlock[]> {
   let userValue = ''
 
+  const { RESOLVED, UNRESOLVED_WITH_MESSAGE, UNRESOLVED_WITH_PLACEHOLDER, UNRESOLVED_WITH_SECRET } =
+    ResolveProgramResponse_StatusEnum()
+
   switch (variable.status) {
-    case ResolveProgramResponse_Status.RESOLVED:
+    case RESOLVED:
       userValue = variable.resolvedValue
       break
 
-    case ResolveProgramResponse_Status.UNRESOLVED_WITH_MESSAGE:
-    case ResolveProgramResponse_Status.UNRESOLVED_WITH_PLACEHOLDER:
-    case ResolveProgramResponse_Status.UNRESOLVED_WITH_SECRET: {
+    case UNRESOLVED_WITH_MESSAGE:
+    case UNRESOLVED_WITH_PLACEHOLDER:
+    case UNRESOLVED_WITH_SECRET: {
       const key = variable.name
       const placeHolder = variable.resolvedValue || variable.originalValue || 'Enter a value please'
-      const hasStringValue =
-        variable.status === ResolveProgramResponse_Status.UNRESOLVED_WITH_PLACEHOLDER
-      const isPassword = variable.status === ResolveProgramResponse_Status.UNRESOLVED_WITH_SECRET
+      const hasStringValue = variable.status === UNRESOLVED_WITH_PLACEHOLDER
+      const isPassword = variable.status === UNRESOLVED_WITH_SECRET
 
       const userInput = await promptUserForVariable(key, placeHolder, hasStringValue, isPassword)
 

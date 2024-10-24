@@ -1,5 +1,5 @@
-import { Terminal as XTerm } from 'xterm-headless'
-import { SerializeAddon } from 'xterm-addon-serialize'
+import { Terminal as XTerm } from '@xterm/headless'
+import { SerializeAddon } from '@xterm/addon-serialize'
 
 import { OutputType } from '../../constants'
 import { RunnerExitReason } from '../runner'
@@ -25,7 +25,7 @@ export interface ITerminalState {
 export class XTermState implements ITerminalState {
   readonly outputType = OutputType.terminal
 
-  private xterm: XTerm
+  protected xterm: XTerm
   private serializer: SerializeAddon
   private processInfo: IProcessInfoState | undefined
 
@@ -88,5 +88,13 @@ export class LocalBufferTermState implements ITerminalState {
 
   serialize(): string {
     return Buffer.concat(this.output).toString('base64')
+  }
+}
+
+export class XTermSerializer extends XTermState {
+  override async write(data: string | Uint8Array): Promise<void> {
+    return new Promise((resolve) => {
+      this.xterm.write(data, resolve)
+    })
   }
 }

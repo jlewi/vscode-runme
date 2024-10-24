@@ -26,9 +26,11 @@ vi.mock('vscode', async () => {
 vi.mock('vscode-telemetry')
 
 vi.mock('../../src/extension/grpc/client', () => ({}))
-vi.mock('../../../src/extension/grpc/runner/v1', () => ({
+vi.mock('../../src/extension/grpc/runner/v1', () => ({
   ResolveProgramRequest_Mode: vi.fn(),
 }))
+
+vi.mock('../../src/extension/features')
 
 describe('NotebookCellManager', () => {
   it('can register cells', async () => {
@@ -297,7 +299,7 @@ describe('NotebookCellOutputManager', () => {
     await outputs.toggleOutput(OutputType.annotations)
     const result = replaceOutput.mock.calls[0][0]
     expect(result).toHaveLength(1)
-    expect(result[0].items).toHaveLength(1)
+    expect(result[0].items).toHaveLength(2)
     expect(result[0].items[0].mime).toBe(OutputType.annotations)
   })
 
@@ -314,7 +316,7 @@ describe('NotebookCellOutputManager', () => {
     const result = replaceOutput.mock.calls[0][0]
 
     expect(result).toHaveLength(1)
-    expect(result[0].items).toHaveLength(1)
+    expect(result[0].items).toHaveLength(2)
     expect(result[0].items[0].mime).toBe(OutputType.annotations)
   })
 

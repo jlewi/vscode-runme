@@ -16,59 +16,37 @@ jobs:
       matrix:
         os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      DO_NOT_TRACK: 1
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.17.0"
+      - name: Install xvfb
+        run: sudo apt-get update -y && sudo apt-get install xvfb
       - name: 👷 Install Dependencies
         run: npm ci
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: 🧪 Setup and Test with Runme
-        uses: coactions/setup-xvfb@v1
-        with:
-          run: npx runme run configureNPM setup build test:ci
+        run: xvfb-run npx runme run configureNPM setup build test:ci
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUNME_TEST_TOKEN: ${{ secrets.RUNME_TEST_TOKEN }}
           RUNME_PROJECT: ${{ github.workspace }}
           SHELL: bash
+          GITHUB_ACTOR: ${{ github.actor }}
       - name: 🔼 Upload Artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: screenshots
           path: |
             tests/e2e/screenshots
             tests/e2e/logs
-      - name: 🔼 Upload coverage
-        uses: actions/upload-artifact@v3
-        if: ${{github.actor != 'dependabot[bot]' && matrix.os == 'ubuntu-latest'}}
-        with:
-          name: coverage
-          path: ./coverage
-          if-no-files-found: error
       - name: 🐛 Debug Build
         uses: stateful/vscode-server-action@v1
         if: failure()
         with:
           timeout: "300000"
-
-  sonarcloud:
-    if: ${{github.actor != 'dependabot[bot]' && vars.EXTENSION_NAME == 'runme'}}
-    name: SonarCloud Analysis
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Retrieve saved coverage
-        uses: actions/download-artifact@v3
-        with:
-          name: coverage
-          path: ./coverage
-
-      - name: SonarCloud Scan
-        uses: SonarSource/sonarcloud-github-action@v2.1.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Needed to get PR information, if any
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

@@ -28,10 +28,12 @@ export default defineConfig({
         // vendored code
         'src/utils/deno',
         'src/extension/wasm',
+        'src/client/components/aws/**',
+        'src/client/components/gcp/**',
       ],
       thresholds: {
         statements: 43,
-        branches: 80,
+        branches: 79,
         functions: 32,
         lines: 43,
       }

@@ -1,9 +1,9 @@
 {
   "name": "runme",
-  "version": "3.5.3",
+  "version": "3.9.0",
   "publisher": "stateful",
-  "displayName": "Runme DevOps Notebooks",
-  "description": "DevOps Workflows Built with Markdown.",
+  "displayName": "Runme Notebooks for DevOps",
+  "description": "Notebooks for DevOps written in Markdown. Runnable, configurable commands/code and embedded terminals. Integrated with cloud consoles, containers and pipelines.",
   "author": "Sebastian Tiedtke <sebastian@stateful.com>",
   "contributors": [
     "Christian Bromann <christian@stateful.com>"
@@ -20,7 +20,8 @@
   },
   "private": true,
   "engines": {
-    "vscode": "^1.72.0"
+    "vscode": "^1.78.0",
+    "node": ">=20.17.0"
   },
   "galleryBanner": {
     "color": "#0D003D",
@@ -56,6 +57,76 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
+  "runme": {
+    "features": {
+      "CopySelectionToClipboard": {
+        "enabled": true,
+        "conditions": {
+          "os": "linux",
+          "enabledForExtensions": {
+            "stateful.platform": true,
+            "stateful.runme": true
+          }
+        }
+      },
+      "RequireStatefulAuth": {
+        "enabled": true,
+        "conditions": {
+          "enabledForExtensions": {
+            "stateful.platform": true,
+            "stateful.runme": true
+          }
+        }
+      },
+      "SignedIn": {
+        "enabled": true,
+        "conditions": {
+          "statefulAuthRequired": true,
+          "enabledForExtensions": {
+            "stateful.platform": true,
+            "stateful.runme": true
+          }
+        }
+      },
+      "ForceLogin": {
+        "enabled": true,
+        "conditions": {
+          "enabledForExtensions": {
+            "stateful.platform": true,
+            "stateful.runme": false
+          }
+        }
+      },
+      "Escalate": {
+        "enabled": true,
+        "conditions": {
+          "statefulAuthRequired": true,
+          "enabledForExtensions": {
+            "stateful.platform": true,
+            "stateful.runme": true
+          }
+        }
+      },
+      "Share": {
+        "enabled": true,
+        "conditions": {
+          "enabledForExtensions": {
+            "stateful.platform": true,
+            "stateful.runme": true
+          }
+        }
+      },
+      "Gist": {
+        "enabled": true,
+        "conditions": {
+          "enabledForExtensions": {
+            "stateful.platform": false,
+            "stateful.runme": true
+          }
+        }
+      }
+    }
+  },
   "contributes": {
     "commands": [
       {
@@ -85,6 +156,10 @@
       {
         "command": "runme.runCliCommand",
         "title": "Run CLI command in new terminal"
+      },
+      {
+        "command": "runme.runForkCommand",
+        "title": "Run fork session in new terminal"
       },
       {
         "command": "runme.surveyWinDefaultShell",
@@ -186,13 +261,13 @@
       {
         "command": "runme.runCategory",
         "category": "Runme",
-        "title": "Execute by Category",
+        "title": "Execute by Tag",
         "icon": "$(group-by-ref-type)"
       },
       {
         "command": "runme.runCellCategory",
         "category": "Runme",
-        "title": "Execute cells with the same Category",
+        "title": "Execute cells with the same Tag",
         "icon": "$(group-by-ref-type)"
       },
       {
@@ -272,10 +347,60 @@
       {
         "command": "runme.cellGistShare",
         "title": "Click to generate GitHub gist link"
+      },
+      {
+        "command": "runme.aiGenerate",
+        "title": "Generate cells using the Foyle AI assistant"
+      },
+      {
+        "command": "runme.environments",
+        "category": "Runme",
+        "title": "Click to select your environment",
+        "shortTitle": "Environments"
+      },
+      {
+        "command": "runme.lifecycleIdentityAll",
+        "title": "Lifecycle Identity - All",
+        "category": "Runme",
+        "description": "Turns on Lifecycle Identity"
+      },
+      {
+        "command": "runme.lifecycleIdentityNone",
+        "title": "Lifecycle Identity - None",
+        "category": "Runme",
+        "description": "Lifecycle Identity - None"
+      },
+      {
+        "command": "runme.lifecycleIdentityDoc",
+        "title": "Lifecycle Identity - Document",
+        "category": "Runme",
+        "description": "Lifecycle Identity - Document"
+      },
+      {
+        "command": "runme.lifecycleIdentityCell",
+        "title": "Lifecycle Identity - Cell",
+        "category": "Runme",
+        "description": "Lifecycle Identity - Cell"
+      },
+      {
+        "command": "runme.lifecycleIdentitySelection",
+        "title": "Lifecycle Identity by Selection",
+        "category": "Runme",
+        "description": "Lifecycle Identity by Selection"
+      },
+      {
+        "command": "runme.openCloudPanel",
+        "title": "Open Cloud Panel",
+        "category": "Runme",
+        "description": "Open Cloud Panel"
       }
     ],
     "menus": {
       "commandPalette": [
+        {
+          "command": "runme.lifecycleIdentitySelection",
+          "when": "false"
+        },
         {
           "command": "runme.toggleTerminal",
           "when": "false"
@@ -515,7 +640,8 @@
           "stateful.runme/error",
           "stateful.runme/github-stdout",
           "stateful.runme/gcp",
-          "stateful.runme/aws"
+          "stateful.runme/aws",
+          "stateful.runme/dagger"
         ],
         "requiresMessaging": "optional"
       }
@@ -535,11 +661,12 @@
             "scope": "window",
             "markdownDescription": "Relative path to a file within the workspace to open within a Runme notebook view, when VS Code starts (e.g. `./CONTRIBUTING.md`)."
           },
-          "runme.experiments.escalationButton": {
+          "runme.experiments.aiAutoCell": {
             "type": "boolean",
             "scope": "window",
             "default": false,
-            "markdownDescription": "If set to `true`, the secondary action button after saving a call will display Save or Escalate depending on the exit code."
+            "title": "AI Auto Cell",
+            "markdownDescription": "If set to `true`, enable AI auto generation of cells. Reload the window after changing this setting."
           },
           "runme.experiments.smartEnvStore": {
             "type": "boolean",
@@ -565,6 +692,24 @@
             "default": true,
             "markdownDescription": "If set to `true`, the extension will bring up the GRPC server."
           },
+          "runme.experiments.shellWarning": {
+            "type": "boolean",
+            "scope": "window",
+            "default": true,
+            "markdownDescription": "If set to `true`, the extension will display an error message if an unsupported shell is detected."
+          },
+          "runme.experiments.reporter": {
+            "type": "boolean",
+            "scope": "window",
+            "default": false,
+            "markdownDescription": "If set to `true`, the extension will use the new reporter API to create outputs."
+          },
+          "runme.experiments.environments": {
+            "type": "boolean",
+            "scope": "window",
+            "default": false,
+            "markdownDescription": "If set to `true`, the extension will allow the user to select an environment."
+          },
           "runme.checkout.projectDir": {
             "type": "string",
             "scope": "machine",
@@ -579,18 +724,18 @@
           "runme.server.customAddress": {
             "type": "string",
             "scope": "window",
-            "markdownDescription": "Custom runme server address. This address will be used instead of launching the server at start. Use this only if you know what you are doing!"
+            "markdownDescription": "Custom kernel server address. This address will be used instead of launching the server at start. Use this only if you know what you are doing!"
           },
           "runme.server.binaryPath": {
             "type": "string",
             "scope": "window",
-            "markdownDescription": "Runme server path to binary. (It requires the GRPC interface enabled)"
+            "markdownDescription": "Kernel server path to binary. (It requires the GRPC interface enabled)"
           },
           "runme.server.enableLogger": {
             "type": "boolean",
             "scope": "machine",
             "default": false,
-            "markdownDescription": "Enable Runme server logs. (It requires the GRPC interface enabled)"
+            "markdownDescription": "Enable Kernel server logs. (It requires the GRPC interface enabled)"
           },
           "runme.server.tlsDir": {
             "type": "string",
@@ -616,7 +761,7 @@
           "runme.server.lifecycleIdentity": {
             "type": "number",
             "scope": "window",
-            "default": 3,
+            "default": 0,
             "enum": [
               0,
               1,
@@ -630,6 +775,16 @@
               "Cell"
             ],
             "markdownDescription": "Select whether or not lifecycle identities of document and/or cells should be presistent inside markdown"
+          },
+          "runme.server.runnerVersion": {
+            "type": "string",
+            "scope": "window",
+            "default": "v1",
+            "enum": [
+              "v1",
+              "v2"
+            ],
+            "markdownDescription": "Runner GRPC version to use"
           },
           "runme.terminal.backgroundTask": {
             "type": "boolean",
@@ -753,18 +908,13 @@
           },
           "runme.app.baseDomain": {
             "type": "string",
-            "default": "",
+            "default": "platform.stateful.com",
             "scope": "window",
             "markdownDescription": "Base domain to be use for Runme app"
           },
-          "runme.app.enableShare": {
-            "type": "boolean",
-            "default": false,
-            "markdownDescription": "Enable collaboration in notebook terminal"
-          },
           "runme.app.panel.runme.cloud": {
             "type": "string",
-            "default": "",
+            "default": "runme.optin",
             "scope": "window",
             "markdownDescription": "Customize cloud panel assignment"
           },
@@ -789,6 +939,12 @@
             "default": true,
             "markdownDescription": "If set to `true`, the notebook's outputs are stored inside a full copy of the original file per session."
           },
+          "runme.app.maskOutputs": {
+            "type": "boolean",
+            "scope": "window",
+            "default": true,
+            "markdownDescription": "If set to `true`, the notebook's outputs are first masked (best effort) before optionally unmasked. `false` inverts the behavior."
+          },
           "runme.app.loginPrompt": {
             "type": "boolean",
             "scope": "window",
@@ -798,8 +954,19 @@
           "runme.app.platformAuth": {
             "type": "boolean",
             "scope": "window",
-            "default": false,
+            "default": true,
             "markdownDescription": "If set to `true` enables Stateful Authentication Provider"
+          },
+          "runme.aiBaseURL": {
+            "type": "string",
+            "default": "http://localhost:8877/api",
+            "description": "The base URL of the AI service."
+          },
+          "runme.app.docsUrl": {
+            "type": "string",
+            "scope": "window",
+            "default": "https://docs.runme.dev",
+            "markdownDescription": "Documentation Base URL"
           }
         }
       }
@@ -898,7 +1065,7 @@
         {
           "id": "runme.cloud",
           "type": "webview",
-          "name": "Cloud",
+          "name": "Commands",
           "visibility": "visible"
         },
         {
@@ -1010,6 +1177,12 @@
         "key": "L",
         "when": "notebookEditorFocused && !inputFocus && !notebookOutputInputFocused",
         "command": "runme.keybinding.noop"
+      },
+      {
+        "command": "runme.aiGenerate",
+        "key": "win+;",
+        "mac": "cmd+;",
+        "when": "notebookType == runme"
       }
     ],
     "terminal": {
@@ -1026,101 +1199,114 @@
     "build": "run-s build:dev",
     "build:dev": "webpack --mode development --node-env development",
     "build:prod": "webpack --mode production --node-env production",
-    "bundle": "vsce package --pre-release --no-git-tag-version --no-update-package-json -o \"./runme-$npm_package_version.vsix\"",
+    "bundle": "vsce package --pre-release --no-git-tag-version --no-update-package-json -o \"./runme-extension.vsix\"",
     "download:wasm": "node .github/scripts/downloadWasm.js",
     "esmify": "echo '{ \"type\": \"module\" }' >> ./out/package.json",
     "postinstall": "run-s postinstall:*",
     "postinstall:wasm": "npm run download:wasm && npm run download:binary",
-    "postinstall:husky": "husky install",
+    "postinstall:husky": "husky",
     "test": "runme run test",
     "watch": "npm run build:dev -- --watch",
     "vscode:prepublish": "npm run prepare-binary",
     "download:binary": "npm run prepare-binary",
     "prepare-binary": "node .github/scripts/downloadAndExtract.js -b bin -n runme",
-    "codegen:runme": "RUNME_TOKEN=$(runme token --api-url https://api.staging.runme.dev --insecure) graphql-codegen --config codegen.ts",
     "codegen:platform": "graphql-codegen --config codegenPlatform.ts"
   },
   "devDependencies": {
-    "@graphql-codegen/cli": "5.0.2",
-    "@graphql-codegen/client-preset": "^4.1.0",
-    "@graphql-codegen/typescript": "4.0.6",
+    "@graphql-codegen/cli": "5.0.3",
+    "@graphql-codegen/client-preset": "^4.4.0",
+    "@graphql-codegen/typescript": "4.1.0",
     "@octokit/rest": "^19.0.13",
     "@types/node": "^18.19.14",
-    "@types/uuid": "^9.0.7",
-    "@types/vscode": "1.72.0",
+    "@types/node-fetch": "^2.6.11",
+    "@types/semver": "^7.5.8",
+    "@types/uuid": "^10.0.0",
+    "@types/vscode": "1.78.0",
     "@types/vscode-notebook-renderer": "^1.72.3",
     "@types/webpack-env": "^1.18.1",
-    "@typescript-eslint/eslint-plugin": "^6.19.0",
-    "@typescript-eslint/parser": "^6.6.0",
-    "@vitest/coverage-v8": "^1.2.2",
-    "@vscode/vsce": "^2.21.0",
-    "@wdio/cli": "^8.27.2",
-    "@wdio/local-runner": "^8.27.2",
-    "@wdio/mocha-framework": "^8.27.2",
-    "@wdio/spec-reporter": "^8.27.2",
-    "chromedriver": "^124.0.1",
-    "comment-json": "^4.2.3",
-    "eslint": "^8.48.0",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "@vitest/coverage-v8": "^2.1.3",
+    "@vscode/vsce": "^2.32.0",
+    "@wdio/cli": "^8.40.6",
+    "@wdio/local-runner": "^8.40.6",
+    "@wdio/mocha-framework": "^8.40.6",
+    "@wdio/spec-reporter": "^8.40.6",
+    "chromedriver": "^129.0.4",
+    "comment-json": "^4.2.5",
+    "eslint": "^8.57.1",
     "eslint-config-prettier": "^9.0.0",
-    "eslint-import-resolver-typescript": "^3.6.0",
-    "eslint-plugin-import": "^2.28.1",
-    "eslint-plugin-unicorn": "^53.0.0",
-    "eslint-plugin-unused-imports": "^3.0.0",
-    "expect-webdriverio": "^4.2.7",
+    "eslint-import-resolver-typescript": "^3.6.3",
+    "eslint-plugin-import": "^2.31.0",
+    "eslint-plugin-unicorn": "^56.0.0",
+    "eslint-plugin-unused-imports": "^4.1.4",
+    "expect-webdriverio": "^4.15.4",
     "fork-ts-checker-webpack-plugin": "^9.0.0",
-    "husky": "^9.0.10",
-    "msw": "^2.1.5",
+    "husky": "^9.1.6",
+    "msw": "^2.4.11",
     "npm-run-all": "^4.1.5",
-    "prettier": "^3.2.4",
+    "prettier": "^3.3.3",
     "runme": "^3.1.0",
-    "semver": "^7.5.4",
+    "semver": "^7.6.3",
     "tar-fs": "^3.0.4",
     "ts-loader": "^9.4.4",
     "ts-node": "^10.9.1",
-    "typescript": "^5.2.2",
-    "unzipper": "^0.11.2",
-    "vitest": "^1.2.2",
+    "typescript": "^5.5.4",
+    "unzipper": "^0.12.3",
+    "vitest": "^2.0.4",
     "vscode-uri": "^3.0.7",
-    "wdio-vscode-service": "^6.0.0",
-    "webdriverio": "^8.20.4",
-    "webpack": "^5.88.2",
+    "wdio-vscode-service": "^6.1.2",
+    "webdriverio": "^8.40.5",
+    "webpack": "^5.95.0",
     "webpack-cli": "^5.1.4"
   },
   "dependencies": {
-    "@apollo/client": "^3.8.3",
-    "@aws-sdk/client-ec2": "^3.515.0",
-    "@buf/grpc_grpc.community_timostamm-protobuf-ts": "^2.9.4-20240430201511-d9455265c5d4.3",
-    "@buf/stateful_runme.community_timostamm-protobuf-ts": "^2.9.4-20240513173256-487ede77bf92.3",
+    "@apollo/client": "^3.11.6",
+    "@aws-sdk/client-ec2": "^3.670.0",
+    "@aws-sdk/client-eks": "^3.670.0",
+    "@aws-sdk/credential-providers": "^3.670.0",
+    "@buf/grpc_grpc.community_timostamm-protobuf-ts": "^2.9.4-20240904201038-e0425cfebb28.4",
+    "@buf/jlewi_foyle.bufbuild_es": "^1.10.0-20241018224331-ac296bc95724.1",
+    "@buf/jlewi_foyle.connectrpc_es": "^1.5.0-20241018224331-ac296bc95724.1",
+    "@buf/stateful_runme.community_timostamm-protobuf-ts": "^2.9.4-20240913234806-45813f39881a.4",
+    "@connectrpc/connect": "^1.4.0",
+    "@connectrpc/connect-node": "^1.6.1",
     "@google-cloud/compute": "^4.1.0",
-    "@google-cloud/container": "^5.6.0",
+    "@google-cloud/container": "^5.18.0",
+    "@google-cloud/run": "^1.4.0",
+    "@kubernetes/client-node": "^0.22.1",
     "@protobuf-ts/grpc-transport": "^2.9.1",
     "@protobuf-ts/runtime": "^2.9.1",
     "@protobuf-ts/runtime-rpc": "^2.9.1",
-    "@vercel/client": "^13.0.1",
+    "@vercel/client": "^13.4.12",
     "@vscode/vscode-languagedetection": "^1.0.22",
     "@vscode/webview-ui-toolkit": "^1.2.2",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-serialize": "^0.13.0",
+    "@xterm/addon-unicode11": "^0.8.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/headless": "^5.5.0",
+    "@xterm/xterm": "^5.5.0",
     "clipboardy": "^4.0.0",
     "cross-fetch": "^4.0.0",
     "data-guardian": "^1.1.2",
     "dotenv": "^16.3.1",
     "filenamify": "^6.0.0",
+    "filesize": "^10.1.6",
     "get-port": "^7.0.0",
+    "getmac": "^6.6.0",
     "got": "^11.8.2",
     "graphql": "^16.8.0",
     "jsonc-parser": "^3.2.1",
-    "lit": "^3.0.0",
-    "octokit": "^3.1.0",
+    "lit": "^3.2.1",
+    "octokit": "^4.0.2",
+    "simple-git": "^3.27.0",
+    "strip-ansi": "^7.1.0",
     "tangle": "^4.0.0",
-    "ulidx": "^2.2.1",
-    "uuid": "^9.0.1",
+    "ulidx": "^2.4.1",
+    "uuid": "^10.0.0",
     "vscode-telemetry": "^1.0.2",
-    "xterm": "^5.3.0",
-    "xterm-addon-fit": "^0.8.0",
-    "xterm-addon-serialize": "^0.11.0",
-    "xterm-addon-unicode11": "^0.6.0",
-    "xterm-addon-web-links": "^0.9.0",
-    "xterm-headless": "^5.3.0",
-    "yaml": "^2.3.2",
-    "zod": "^3.22.2"
+    "yaml": "^2.6.0",
+    "zod": "^3.23.8"
   }
 }

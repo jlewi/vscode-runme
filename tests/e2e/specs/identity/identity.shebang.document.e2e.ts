@@ -1,17 +1,7 @@
 import { Key } from 'webdriverio'
 
 import { RunmeNotebook } from '../../pageobjects/notebook.page.js'
-import {
-  assertDocumentContainsSpinner,
-  revertChanges,
-  saveFile,
-  updateLifecycleIdentitySetting,
-} from '../../helpers/index.js'
-
-async function reloadWindow() {
-  const workbench = await browser.getWorkbench()
-  await workbench.executeCommand('Developer: Reload Window')
-}
+import { assertDocumentContainsSpinner, revertChanges, saveFile } from '../../helpers/index.js'
 
 async function removeAllNotifications() {
   const workbench = await browser.getWorkbench()
@@ -26,6 +16,9 @@ describe('Test suite: Shebang with setting Document only (2)', async () => {
 
   const notebook = new RunmeNotebook()
   it('open identity markdown file', async () => {
+    const workbench = await browser.getWorkbench()
+    await workbench.executeCommand('Runme: Lifecycle Identity - Doc')
+
     await browser.executeWorkbench(async (vscode) => {
       const doc = await vscode.workspace.openTextDocument(
         vscode.Uri.file(`${vscode.workspace.rootPath}/tests/fixtures/identity/shebang.md`),
@@ -47,13 +40,11 @@ describe('Test suite: Shebang with setting Document only (2)', async () => {
       return `${vscode.workspace.rootPath}${documentPath}`
     }, '/tests/fixtures/identity/shebang.md')
 
-    await updateLifecycleIdentitySetting(2)
-    await reloadWindow()
     await notebook.focusDocument()
     const workbench = await browser.getWorkbench()
     await workbench.executeCommand('Notebook: Focus First Cell')
     await browser.keys([Key.Enter])
-    const cell = await notebook.getCell('console.log("Run scripts via Shebang!")')
+    const cell = await notebook.getCell('console.log("Scenario 1: Run scripts via Shebang!")')
     await cell.focus()
     await saveFile(browser)
 
@@ -68,10 +59,10 @@ describe('Test suite: Shebang with setting Document only (2)', async () => {
       ## Shebang
       Example file used as part of the end to end suite
 
-      ## Scenario
+      ## Scenario 1
 
       \`\`\`js {"name":"foo"}
-      console.log("Run scripts via Shebang!")
+      console.log("Scenario 1: Run scripts via Shebang!")
 
       \`\`\`
 

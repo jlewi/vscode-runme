@@ -38,6 +38,11 @@ import {
 const REGEX_WEB_RESOURCE = /^https?:\/\//
 const log = getLogger('RunmeUriHandler')
 
+const extensionNames: { [key: string]: string } = {
+  'stateful.platform': 'Stateful',
+  'stateful.runme': 'Runme',
+}
+
 export class RunmeUriHandler implements UriHandler, Disposable {
   #disposables: Disposable[] = []
   readonly #onAuth = this.register(new EventEmitter<Uri>())
@@ -52,7 +57,6 @@ export class RunmeUriHandler implements UriHandler, Disposable {
   async handleUri(uri: Uri) {
     log.info(`triggered RunmeUriHandler with ${uri}`)
     const params = new URLSearchParams(uri.query)
-    const windowId = params.get('windowId')
     const state = params.get('state')
     const code = params.get('code')
     const command = params.get('command')
@@ -61,7 +65,7 @@ export class RunmeUriHandler implements UriHandler, Disposable {
       window.showErrorMessage('No query parameter "command" provided')
       return
     }
-    if (command === 'auth' && windowId && state && code) {
+    if (command === 'auth' && state && code) {
       TelemetryReporter.sendTelemetryEvent('extension.uriHandler', {
         command,
         type: AuthenticationProviders.Stateful,
@@ -128,7 +132,7 @@ export class RunmeUriHandler implements UriHandler, Disposable {
       }
     }
 
-    window.showErrorMessage(`Couldn't recognise command "${command}"`)
+    window.showErrorMessage(`Couldn't recognize command "${command}"`)
   }
 
   private async _setupProject(fileToOpen: string, repository?: string | null) {
@@ -152,7 +156,8 @@ export class RunmeUriHandler implements UriHandler, Disposable {
       projectDirUri,
       ...(await getTargetDirName(projectDirUri, suggestedProjectName)).split('/'),
     )
-    window.showInformationMessage('Setting up a new project using Runme...')
+    const extensionTitle = extensionNames[this?.context?.extension?.id] || 'Runme'
+    window.showInformationMessage(`Setting up a new project using ${extensionTitle}...`)
     return window.withProgress(
       {
         location: ProgressLocation.Window,
@@ -208,7 +213,7 @@ export class RunmeUriHandler implements UriHandler, Disposable {
       TaskScope.Workspace,
       'Clone Repo',
       'exec',
-      new ShellExecution(`git clone ${repository} "${targetDirUri.fsPath}"`),
+      new ShellExecution(`git clone --depth=1 ${repository} "${targetDirUri.fsPath}"`),
     )
 
     const success = await new Promise<boolean>((resolve) => {

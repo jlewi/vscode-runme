@@ -14,6 +14,7 @@ export enum OutputType {
   stdout = 'application/vnd.code.notebook.stdout',
   gcp = 'stateful.runme/gcp',
   aws = 'stateful.runme/aws',
+  dagger = 'stateful.runme/dagger',
 }
 
 export enum ClientMessages {
@@ -26,8 +27,6 @@ export enum ClientMessages {
   getState = 'common:getState',
   onGetState = 'common:onGetState',
   onCategoryChange = 'common:onCategoryChange',
-  cloudApiRequest = 'common:cloudApiRequest',
-  cloudApiResponse = 'common:cloudApiResponse',
   platformApiRequest = 'common:platformApiRequest',
   platformApiResponse = 'common:platformApiResponse',
   optionsMessage = 'common:optionsMessage',
@@ -61,8 +60,17 @@ export enum ClientMessages {
   gcpVMInstanceAction = 'gcp:gceVMInstanceAction',
   awsEC2Instances = 'aws:ec2Instances',
   awsEC2InstanceAction = 'aws:ec2InstanceAction',
+  awsEKSClusterAction = 'aws:eksClusterAction',
   onAuthorModeChange = 'common:onAuthorModeChange',
   gistCell = 'gist:cell',
+  gcpCloudRunAction = 'gcp:cloudRunAction',
+  gcpLoadServices = 'gcp:loadServices',
+  gcpServicesLoaded = 'gcp:servicesLoaded',
+  daggerSyncState = 'dagger:syncState',
+  daggerCliAction = 'dagger:cliAction',
+  featuresUpdateAction = 'features:updateAction',
+  featuresRequest = 'features:request',
+  featuresResponse = 'features:response',
 }
 
 // [pretty print, languageId, destination]
@@ -132,6 +140,8 @@ export const LANGUAGES = new Map(
  * "shellscript," so this object maps "shellscript" -> "sh"
  */
 export const VSCODE_LANGUAGEID_MAP: Record<string, string | undefined> = {
+  console: 'sh',
+  shell: 'sh',
   shellscript: 'sh',
   javascriptreact: 'jsx',
   typescriptreact: 'tsx',
@@ -155,6 +165,7 @@ export enum RENDERERS {
   GitHubWorkflowViewer = 'github-workflow-viewer',
   GCPView = 'gcp-view',
   AWSView = 'aws-view',
+  DaggerCli = 'dagger-cli',
 }
 
 export enum AuthenticationProviders {
@@ -170,6 +181,7 @@ export enum NotebookMode {
 export const NOTEBOOK_AVAILABLE_CATEGORIES = 'notebookAvailableCategories'
 export const NOTEBOOK_HAS_CATEGORIES = 'notebookHasCategories'
 export const NOTEBOOK_AUTOSAVE_ON = 'notebookAutoSaveOn'
+export const NOTEBOOK_LIFECYCLE_ID = 'notebookLifecycleId'
 export const NOTEBOOK_OUTPUTS_MASKED = 'notebookOutputsMasked'
 export const NOTEBOOK_MODE = 'notebookMode'
 export const NOTEBOOK_HAS_OUTPUTS = 'notebookHasRunmeOutputs'
@@ -1090,6 +1102,7 @@ export enum TELEMETRY_EVENTS {
   RecommendExtension = 'runme.recommendExtension',
   NotebookGist = 'runme.notebookGist',
   CellGist = 'runme.cellGist',
+  ShellWarning = 'extension.shellWarning',
 }
 
 export enum WebViews {
@@ -1102,5 +1115,7 @@ export const CATEGORY_SEPARATOR = ','
 export const EXECUTION_CELL_STORAGE_KEY = 'executionCell'
 export const EXECUTION_CELL_CREATION_DATE_STORAGE_KEY = 'executionCellCreationDate'
 export const SAVE_CELL_LOGIN_CONSENT_STORAGE_KEY = 'loginConsent'
-export const CLOUD_USER_SIGNED_IN = 'userSignedIn'
+export const GITHUB_USER_SIGNED_IN = 'userSignedIn'
 export const PLATFORM_USER_SIGNED_IN = 'platformUserSignedIn'
+
+export const RUNME_FRONTMATTER_PARSED = 'runme.dev/frontmatterParsed'

@@ -9,11 +9,20 @@ import saveCellExecution, {
 import { Kernel } from '../../../../src/extension/kernel'
 import { ClientMessages } from '../../../../src/constants'
 import { APIMethod } from '../../../../src/types'
-import { getCellById } from '../../../../src/extension/cell'
+import { GrpcSerializer } from '../../../../src/extension/serializer'
 
 vi.mock('vscode-telemetry')
 vi.mock('../../../src/extension/runner', () => ({}))
 vi.mock('../../../src/extension/grpc/runner/v1', () => ({}))
+vi.mock('node:os', async (importOriginal) => {
+  const original = (await importOriginal()) as any
+  return {
+    default: {
+      ...original.default,
+      platform: vi.fn().mockReturnValue('linux'),
+    },
+  }
+})
 
 vi.mock('vscode', async () => {
   const mocked = (await vi.importActual('../../../../__mocks__/vscode')) as any
@@ -27,11 +36,6 @@ vi.mock('vscode', async () => {
     },
     window: {
       ...mocked.window,
-      activeTextEditor: {
-        document: {
-          fileName: '/foo/bar/README.md',
-        },
-      },
     },
   }
 })
@@ -45,7 +49,7 @@ vi.mock('../../../../src/extension/cell', async () => {
 })
 
 const graphqlHandlers = [
-  graphql.mutation('CreateCellExecution', () => {
+  graphql.mutation('CreateExtensionCellOutput', () => {
     return HttpResponse.json({
       data: {
         id: 'cell-id',
@@ -69,31 +73,32 @@ afterEach(() => {
   server.resetHandlers()
 })
 
+const mockCellInCache = (kernel, cellId) => {
+  vi.spyOn(kernel, 'getNotebookDataCache').mockImplementationOnce(() => ({
+    cells: [],
+  }))
+  vi.spyOn(GrpcSerializer, 'marshalNotebook').mockReturnValueOnce({
+    cells: [
+      {
+        kind: 2,
+        languageId: 'markdown',
+        outputs: [],
+        value: '',
+        metadata: {
+          id: cellId,
+        },
+      },
+    ],
+    metadata: {},
+  })
+}
+
 suite('Save cell execution', () => {
   const kernel = new Kernel({} as any)
-  kernel.getTerminal = vi.fn().mockReturnValue({
-    processId: 100,
-    runnerSession: {
-      hasExited: vi.fn(),
-    },
-  })
-
+  kernel.hasExperimentEnabled = vi.fn((params) => params === 'reporter')
   it('Should save the output for authenticated user', async () => {
-    const cell: any = {
-      metadata: { name: 'foobar', id: 'cell-id', ['runme.dev/id']: 'cell-id' },
-      document: {
-        uri: { fsPath: '/foo/bar/README.md' },
-        getText: () => 'hello world',
-        languageId: 'sh',
-      },
-      kind: 2,
-    }
-
-    cell.notebook = {
-      getCells: () => [cell],
-      isDirty: false,
-    }
-    vi.mocked(getCellById).mockResolvedValue(cell)
+    const cellId = 'cell-id'
+    mockCellInCache(kernel, cellId)
     const messaging = notebooks.createRendererMessaging('runme-renderer')
     const authenticationSession: AuthenticationSession = {
       accessToken: '',
@@ -107,7 +112,7 @@ suite('Save cell execution', () => {
     const message = {
       type: ClientMessages.platformApiRequest,
       output: {
-        id: 'cell-id',
+        id: cellId,
         method: APIMethod.CreateCellExecution,
         data: {
           stdout: 'hello world',
@@ -119,6 +124,8 @@ suite('Save cell execution', () => {
       message,
       editor: {
         notebook: {
+          save: vi.fn(),
+          uri: { fsPath: '/foo/bar/README.md' },
           metadata: {
             ['runme.dev/frontmatterParsed']: { runme: { id: 'ulid' } },
           },
@@ -140,13 +147,20 @@ suite('Save cell execution', () => {
           [
             {
               "output": {
+                "snapshot": "{"features":{},"context":{"os":"linux","vsCodeVersion":"9.9.9","githubAuth":false,"statefulAuth":false}}",
+              },
+              "type": "features:updateAction",
+            },
+          ],
+          [
+            {
+              "output": {
                 "data": {
                   "data": {
                     "htmlUrl": "https://app.runme.dev/cell/gotyou!",
                     "id": "cell-id",
                   },
                 },
-                "escalationButton": false,
                 "id": "cell-id",
               },
               "type": "common:platformApiResponse",
@@ -154,6 +168,10 @@ suite('Save cell execution', () => {
           ],
         ],
         "results": [
+          {
+            "type": "return",
+            "value": undefined,
+          },
           {
             "type": "return",
             "value": undefined,
@@ -168,25 +186,12 @@ suite('Save cell execution', () => {
   })
 
   it('Should not save cell output when user is not authenticated', async () => {
-    const cell: any = {
-      metadata: { name: 'foobar', id: 'cell-id', ['runme.dev/id']: 'cell-id' },
-      document: {
-        uri: { fsPath: '/foo/bar/README.md' },
-        getText: () => 'hello world',
-        languageId: 'sh',
-      },
-      kind: 2,
-    }
-    cell.notebook = {
-      getCells: () => [cell],
-      isDirty: false,
-    }
-    vi.mocked(getCellById).mockResolvedValue(cell)
+    const cellId = 'cell-id'
     const messaging = notebooks.createRendererMessaging('runme-renderer')
     const message = {
       type: ClientMessages.platformApiRequest,
       output: {
-        id: 'cell-id',
+        id: cellId,
         method: APIMethod.CreateCellExecution,
         data: {
           stdout: 'hello world',
@@ -198,6 +203,8 @@ suite('Save cell execution', () => {
       message,
       editor: {
         notebook: {
+          save: vi.fn(),
+          uri: { fsPath: '/foo/bar/README.md' },
           metadata: {
             ['runme.dev/frontmatterParsed']: { runme: { id: 'ulid' } },
           },
@@ -205,7 +212,6 @@ suite('Save cell execution', () => {
       } as any,
     }
     vi.mocked(authentication.getSession).mockResolvedValue(undefined)
-
     await saveCellExecution(requestMessage, kernel)
 
     expect(messaging.postMessage).toMatchInlineSnapshot(`
@@ -219,13 +225,20 @@ suite('Save cell execution', () => {
           [
             {
               "output": {
+                "snapshot": "{"features":{},"context":{"os":"linux","vsCodeVersion":"9.9.9","githubAuth":false,"statefulAuth":false}}",
+              },
+              "type": "features:updateAction",
+            },
+          ],
+          [
+            {
+              "output": {
                 "data": {
                   "data": {
                     "htmlUrl": "https://app.runme.dev/cell/gotyou!",
                     "id": "cell-id",
                   },
                 },
-                "escalationButton": false,
                 "id": "cell-id",
               },
               "type": "common:platformApiResponse",
@@ -237,7 +250,6 @@ suite('Save cell execution', () => {
                 "data": {
                   "displayShare": false,
                 },
-                "escalationButton": false,
                 "id": "cell-id",
               },
               "type": "common:platformApiResponse",
@@ -257,8 +269,135 @@ suite('Save cell execution', () => {
             "type": "return",
             "value": undefined,
           },
+          {
+            "type": "return",
+            "value": undefined,
+          },
         ],
       }
     `)
+  })
+
+  it("Should throw if there's not cache notebook", async () => {
+    const cellId = 'cell-id'
+    const cacheId = 'cache-id'
+
+    const authenticationSession: AuthenticationSession = {
+      accessToken: '',
+      id: '',
+      scopes: ['repo'],
+      account: {
+        id: '',
+        label: '',
+      },
+    }
+    vi.spyOn(GrpcSerializer, 'getDocumentCacheId').mockReturnValueOnce(cacheId)
+    vi.mocked(authentication.getSession).mockResolvedValue(authenticationSession)
+    vi.spyOn(kernel, 'getNotebookDataCache').mockImplementationOnce(() => undefined)
+
+    const messaging = notebooks.createRendererMessaging('runme-renderer')
+    const message = {
+      type: ClientMessages.platformApiRequest,
+      output: {
+        id: cellId,
+        method: APIMethod.CreateCellExecution,
+        data: {
+          stdout: 'hello world',
+        },
+      },
+    } as any
+    const requestMessage: APIRequestMessage = {
+      messaging,
+      message,
+      editor: {
+        notebook: {
+          save: vi.fn(),
+          uri: { fsPath: '/foo/bar/README.md' },
+          metadata: {
+            ['runme.dev/frontmatterParsed']: { runme: { id: 'ulid' } },
+          },
+        },
+      } as any,
+    }
+    await saveCellExecution(requestMessage, kernel)
+
+    expect(messaging.postMessage).toHaveBeenCalledWith({
+      output: {
+        data: `Notebook data cache not found for cache ID: ${cacheId}`,
+        hasErrors: true,
+        id: cellId,
+      },
+      type: ClientMessages.platformApiResponse,
+    })
+  })
+
+  it("Should throw if there's the cell is not found in the marshalled notebook", async () => {
+    const cellId = 'cell-id'
+    const cacheId = 'cache-id'
+    const notebookId = 'ulid'
+
+    const authenticationSession: AuthenticationSession = {
+      accessToken: '',
+      id: '',
+      scopes: ['repo'],
+      account: {
+        id: '',
+        label: '',
+      },
+    }
+    vi.spyOn(GrpcSerializer, 'getDocumentCacheId').mockReturnValueOnce(cacheId)
+    vi.mocked(authentication.getSession).mockResolvedValue(authenticationSession)
+    vi.spyOn(kernel, 'getNotebookDataCache').mockImplementationOnce(() => ({
+      cells: [],
+    }))
+    vi.spyOn(GrpcSerializer, 'marshalNotebook').mockReturnValueOnce({
+      cells: [],
+      metadata: {},
+      frontmatter: {
+        terminalRows: '0',
+        category: 'notebook',
+        cwd: '/foo/bar',
+        shell: 'bash',
+        skipPrompts: false,
+        runme: {
+          version: '0.0.1',
+          id: notebookId,
+        },
+      },
+    })
+    const messaging = notebooks.createRendererMessaging('runme-renderer')
+    const message = {
+      type: ClientMessages.platformApiRequest,
+      output: {
+        id: cellId,
+        method: APIMethod.CreateCellExecution,
+        data: {
+          stdout: 'hello world',
+        },
+      },
+    } as any
+    const requestMessage: APIRequestMessage = {
+      messaging,
+      message,
+      editor: {
+        notebook: {
+          save: vi.fn(),
+          uri: { fsPath: '/foo/bar/README.md' },
+          metadata: {
+            ['runme.dev/frontmatterParsed']: { runme: { id: 'ulid' } },
+          },
+        },
+      } as any,
+    }
+    await saveCellExecution(requestMessage, kernel)
+
+    expect(messaging.postMessage).toHaveBeenCalledWith({
+      output: {
+        data: `Cell not found in notebook ${notebookId}`,
+        hasErrors: true,
+        id: cellId,
+      },
+      type: ClientMessages.platformApiResponse,
+    })
   })
 })

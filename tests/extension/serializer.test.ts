@@ -7,11 +7,14 @@ import {
   workspace,
 } from 'vscode'
 import { expect, vi, it, describe, beforeEach } from 'vitest'
+import { isValid } from 'ulidx'
 
 import { GrpcSerializer, SerializerBase, WasmSerializer } from '../../src/extension/serializer'
+import { RunmeIdentity } from '../../src/extension/grpc/serializerTypes'
 import type { Kernel } from '../../src/extension/kernel'
 import { EventEmitter, Uri } from '../../__mocks__/vscode'
 import { Serializer } from '../../src/types'
+import ContextState from '../../src/extension/contextState'
 
 import fixtureMarshalNotebook from './fixtures/marshalNotebook.json'
 
@@ -26,6 +29,8 @@ vi.mock('vscode', () => ({
   window: {
     activeNotebookEditor: undefined,
     showErrorMessage: vi.fn().mockResolvedValue({}),
+    createOutputChannel: vi.fn(),
+    createTextEditorDecorationType: vi.fn().mockResolvedValue({}),
   },
   Uri: { joinPath: vi.fn().mockReturnValue('/foo/bar') },
   workspace: {
@@ -45,6 +50,7 @@ vi.mock('vscode', () => ({
   WorkspaceEdit: Map<Uri, NotebookEdit[]>,
   NotebookEdit: {
     updateCellMetadata: (i: number, metadata: any) => ({ i, metadata, type: 'updateCellMetadata' }),
+    updateNotebookMetadata: (metadata: any) => ({ metadata, type: 'updateNotebookMetadata' }),
   },
   CancellationTokenSource: vi.fn(),
   NotebookData: class {
@@ -63,6 +69,10 @@ vi.mock('../../src/extension/utils', () => ({
   initWasm: vi.fn(),
 }))
 
+vi.mock('../../src/extension/features')
+
+vi.mock('../../src/extension/contextState')
+
 function newKernel(): Kernel {
   return {} as unknown as Kernel
 }
@@ -74,6 +84,16 @@ describe('SerializerBase', () => {
 
   it('serializeNotebook transforms languages', async () => {
     const TestSerializer = class extends SerializerBase {
+      public getMaskedCache(_cacheId: string): Promise<Uint8Array> | undefined {
+        throw new Error('Method not implemented.')
+      }
+      public getPlainCache(_cacheId: string): Promise<Uint8Array> | undefined {
+        throw new Error('Method not implemented.')
+      }
+      public getNotebookDataCache(_cacheId: string): NotebookData | undefined {
+        throw new Error('Method not implemented.')
+      }
+
       protected async saveNotebookOutputsByCacheId(_cacheId: string): Promise<number> {
         return 0
       }
@@ -249,16 +269,56 @@ describe('GrpcSerializer', () => {
     })
   })
 
-  describe('#getDocumentLifecycleId', () => {
-    it('should return the document lifecycle ID if present', () => {
+  describe('#addCellId', () => {
+    const copyCell = () =>
+      JSON.parse(
+        JSON.stringify({
+          kind: 2,
+          value: '$ date | tee /dev/stderr',
+          languageId: 'sh',
+          metadata: {
+            'runme.dev/id': '01HF7B0KJPF469EG9ZVSTKPEZ6',
+            interactive: 'true',
+            name: 'stdio-test',
+          },
+        }),
+      )
+
+    it('should never run against cells returned by the kernel', () => {
+      const cell = copyCell()
+      const res = GrpcSerializer.addCellId(cell.metadata, RunmeIdentity.ALL)
+      expect(res['runme.dev/id']).toStrictEqual(cell.metadata['runme.dev/id'])
+      expect(res['id']).toBeUndefined()
+    })
+
+    it('should add id to cell metadata when identity requires it', () => {
+      const cell = { metadata: {} }
+      const res = GrpcSerializer.addCellId(cell.metadata, RunmeIdentity.CELL)
+      expect(res['runme.dev/id']).toBeDefined()
+      expect(isValid(res['runme.dev/id'])).toBeTruthy()
+      expect(res['id']).toBeDefined()
+      expect(isValid(res['id'])).toBeTruthy()
+    })
+
+    it('should only add runme.dev/id to cell metadata when no identity is required', () => {
+      const cell = { metadata: {} }
+      const res = GrpcSerializer.addCellId(cell.metadata, RunmeIdentity.DOCUMENT)
+      expect(res['runme.dev/id']).toBeDefined()
+      expect(isValid(res['runme.dev/id'])).toBeTruthy()
+      expect(res['id']).toBeUndefined()
+    })
+  })
+
+  describe('#getDocumentCacheId', () => {
+    it('should return the document cache ID if present', () => {
       const fixture = deepCopyFixture()
       const res = GrpcSerializer.getDocumentCacheId(fixture.metadata)
-      expect(res).toStrictEqual('01HF7B0KJPF469EG9ZWDNKKACQ')
+      expect(res).toStrictEqual('01J97S5FVEKBPD9GAH0AZBV0HB')
     })
 
     it('should return undefined for documents without lifecycle IDs', () => {
       const fixture = deepCopyFixture()
-      delete fixture.metadata['runme.dev/frontmatterParsed']?.['runme']
+      delete fixture.metadata['runme.dev/cacheId']
 
       const res = GrpcSerializer.getDocumentCacheId(fixture.metadata)
       expect(res).toBeUndefined()
@@ -267,6 +327,112 @@ describe('GrpcSerializer', () => {
     it('should return undefined for undefined metadata', () => {
       const res = GrpcSerializer.getDocumentCacheId(undefined)
       expect(res).toBeUndefined()
+    })
+  })
+
+  describe('#switchLifecycleIdentity', () => {
+    const fakeSrcDocUri = { fsPath: '/tmp/fake/source.md' } as any
+
+    it('should not run for session outputs', async () => {
+      const fixture = deepCopyFixture()
+      fixture.metadata['runme.dev/frontmatterParsed'].runme.session = { id: 'FAKE-SESSION' }
+
+      const serializer: any = new GrpcSerializer(context, new Server(), new Kernel())
+
+      const applied = await serializer.switchLifecycleIdentity(
+        {
+          uri: fakeSrcDocUri,
+          metadata: fixture.metadata,
+        },
+        1, // aka RunmeIdentity.ALL
+      )
+
+      expect(applied).toBeFalsy()
+    })
+
+    it('should apply lifecycle identity retaining initial IDs', async () => {
+      const fixture = deepCopyFixture()
+      const descells = fixture.cells.map((cell, i) => {
+        cell.index = i
+        const c = { ...cell }
+        c.metadata = { ...cell.metadata }
+        // simluate different ephemeral IDs here to make sure they are not used once applied
+        c.metadata['runme.dev/id'] = c.metadata['runme.dev/id'].toString().slice(0, 10)
+        c.metadata['id'] = c.metadata['runme.dev/id']
+        return c
+      })
+      const metadata = { ...fixture.metadata }
+      metadata['runme.dev/cacheId'] = metadata['runme.dev/cacheId'].toString().slice(0, 10)
+
+      const serializer: any = new GrpcSerializer(context, new Server(), new Kernel())
+      serializer.client = {
+        deserialize: vi.fn().mockResolvedValue({
+          response: { notebook: { cells: descells, metadata } },
+        }),
+      }
+      vi.mocked(workspace.applyEdit).mockResolvedValue(true)
+
+      const save = vi.fn()
+      const applied = await serializer.switchLifecycleIdentity(
+        {
+          uri: fakeSrcDocUri,
+          metadata: fixture.metadata,
+          save,
+          getCells: vi.fn().mockReturnValue(fixture.cells),
+        },
+        1, // aka RunmeIdentity.ALL
+      )
+
+      const expectedEdits = new Map()
+      expectedEdits.set(
+        {
+          fsPath: '/tmp/fake/source.md',
+        },
+        [
+          {
+            metadata: {
+              'runme.dev/cacheId': '01J97S5FVEKBPD9GAH0AZBV0HB',
+              'runme.dev/finalLineBreaks': '1',
+              'runme.dev/frontmatter':
+                '---\nrunme:\n  id: 01HF7B0KJPF469EG9ZWDNKKACQ\n  version: v2.0\n---',
+              'runme.dev/frontmatterParsed': {
+                cwd: '',
+                runme: {
+                  id: '01HF7B0KJPF469EG9ZWDNKKACQ',
+                  version: 'v2.0',
+                },
+                shell: '',
+                skipPrompts: false,
+              },
+            },
+            type: 'updateNotebookMetadata',
+          },
+          {
+            i: 0,
+            metadata: {
+              id: '01HF7B0KJPF469EG9ZVSTKPEZ6',
+              interactive: 'true',
+              name: 'stdio-test',
+              'runme.dev/id': '01HF7B0KJPF469EG9ZVSTKPEZ6',
+            },
+            type: 'updateCellMetadata',
+          },
+          {
+            i: 1,
+            metadata: {
+              background: 'false',
+              id: '01HF7B0KJPF469EG9ZVX256S75',
+              interactive: 'true',
+              'runme.dev/id': '01HF7B0KJPF469EG9ZVX256S75',
+            },
+            type: 'updateCellMetadata',
+          },
+        ],
+      )
+
+      expect(save).toBeCalled()
+      expect(workspace.applyEdit).toBeCalledWith(expectedEdits)
+      expect(applied).toBeTruthy()
     })
   })
 
@@ -331,12 +497,14 @@ describe('GrpcSerializer', () => {
     it('should remove parse frontmatter on serialization', () => {
       const outputsFixture = deepCopyFixture()
       expect(outputsFixture.cells.length).toBe(2)
+      expect(outputsFixture.metadata['runme.dev/cacheId']).toBeDefined()
       expect(outputsFixture.metadata['runme.dev/frontmatterParsed']).toBeDefined()
-      expect(Object.keys(outputsFixture.metadata).length).toStrictEqual(3)
+      expect(Object.keys(outputsFixture.metadata).length).toStrictEqual(4)
 
       const notebookData = GrpcSerializer.marshalNotebook(outputsFixture)
+      expect(outputsFixture.metadata['runme.dev/cacheId']).toBeDefined()
       expect(notebookData.metadata['runme.dev/frontmatterParsed']).toBeUndefined()
-      expect(Object.keys(notebookData.metadata).length).toStrictEqual(2)
+      expect(Object.keys(notebookData.metadata).length).toStrictEqual(3)
     })
   })
 
@@ -345,7 +513,7 @@ describe('GrpcSerializer', () => {
 
     it("maps document lifecycle ids to source doc's URIs on notebook opening", async () => {
       const fixture = deepCopyFixture()
-      const lid = fixture.metadata['runme.dev/frontmatterParsed'].runme.id
+      const cacheId = fixture.metadata['runme.dev/cacheId']
 
       const serializer: any = new GrpcSerializer(context, new Server(), new Kernel())
 
@@ -356,7 +524,7 @@ describe('GrpcSerializer', () => {
         metadata: fixture.metadata,
       })
 
-      const lidDocUri = serializer.cacheDocUriMapping.get(lid)
+      const lidDocUri = serializer.cacheDocUriMapping.get(cacheId)
       expect(lidDocUri).toStrictEqual(fakeSrcDocUri)
     })
 
@@ -460,10 +628,8 @@ describe('GrpcSerializer', () => {
         writeableSer.client = {
           serialize: vi.fn().mockResolvedValue({ response: { result: fakeCachedBytes } }),
         }
-        writeableSer.cacheDocUriMapping.set(
-          fixture.metadata['runme.dev/frontmatterParsed'].runme.id,
-          fakeSrcDocUri,
-        )
+        writeableSer.cacheDocUriMapping.set(fixture.metadata['runme.dev/cacheId'], fakeSrcDocUri)
+        ContextState.getKey = vi.fn().mockImplementation(() => true)
         GrpcSerializer.sessionOutputsEnabled = vi.fn().mockReturnValue(true)
         GrpcSerializer.getOutputsUri = vi.fn().mockImplementation(() => fakeSrcDocUri)
 
@@ -479,7 +645,7 @@ describe('GrpcSerializer', () => {
         })
 
         expect(workspace.fs.writeFile).toBeCalledWith(fakeSrcDocUri, fakeCachedBytes)
-        expect(workspace.fs.writeFile).toHaveBeenCalledTimes(3)
+        expect(workspace.fs.writeFile).toHaveBeenCalledTimes(2)
       })
     })
 
@@ -496,6 +662,13 @@ describe('GrpcSerializer', () => {
         '/tmp/fake/runbook-01HGX8KYWM9K41YVYP0CNR3TZW.md',
       )
       expect(sourceFilePath).toStrictEqual('/tmp/fake/runbook.md')
+    })
+
+    it('can reverse the process even with mulitple dashes to get the source document path', () => {
+      const sourceFilePath = GrpcSerializer.getSourceFilePath(
+        '/tmp/fake/my-runbook-01HGX8KYWM9K41YVYP0CNR3TZW.md',
+      )
+      expect(sourceFilePath).toStrictEqual('/tmp/fake/my-runbook.md')
     })
 
     it('should include session and document info on serialization', async () => {
@@ -552,9 +725,11 @@ describe('GrpcSerializer', () => {
 
   describe('apply cell lifecycle identity', () => {
     it('skips cells if identity does not require it', async () => {
-      const serializer: any = new GrpcSerializer(context, new Server(), new Kernel())
-      serializer.lifecycleIdentity = 2 // DOC identity which excludes cells
+      // make serializer.lifecycleIdentity return 2
+      ContextState.getKey = vi.fn().mockImplementation(() => 2)
       const fixture = deepCopyFixture()
+
+      const serializer: any = new GrpcSerializer(context, new Server(), new Kernel())
 
       fixture.cells.forEach((cell: { kind: number; metadata: { [x: string]: any } }) => {
         cell.metadata['runme.dev/id'] = cell.metadata['id']
@@ -592,17 +767,19 @@ describe('GrpcSerializer', () => {
       const fixture = deepCopyFixture()
 
       fixture.cells.forEach((cell: { metadata: { [x: string]: any } }) => {
-        cell.metadata['runme.dev/id'] = cell.metadata['id']
         delete cell.metadata['id']
         expect(cell.metadata['id']).toBeUndefined()
       })
+
+      // make serializer.lifecycleIdentity return 3
+      ContextState.getKey = vi.fn().mockImplementation(() => 3)
 
       const applied = serializer.applyIdentity(fixture)
 
       const ref = deepCopyFixture()
       applied.cells.forEach((cell: { metadata: { [x: string]: any } }, i: number) => {
         expect(cell.metadata['id']).toBeDefined()
-        expect(cell.metadata['id']).toStrictEqual(ref.cells[i].metadata['id'])
+        expect(cell.metadata['runme.dev/id']).toStrictEqual(ref.cells[i].metadata['runme.dev/id'])
       })
     })
   })

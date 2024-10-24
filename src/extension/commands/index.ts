@@ -27,17 +27,18 @@ import {
   getCLIUseIntegratedRunme,
   getTLSEnabled,
   isNotebookTerminalEnabledForCell,
-  isRunmeAppButtonsEnabled,
 } from '../../utils/configuration'
 import { Kernel } from '../kernel'
 import {
   getAnnotations,
   getNotebookCategories,
+  getPlatformAuthSession,
   getTerminalByCell,
   openFileAsRunmeNotebook,
   promptUserSession,
+  warnBetaRequired,
 } from '../utils'
-import { NotebookToolbarCommand, NotebookUiEvent } from '../../types'
+import { NotebookToolbarCommand, NotebookUiEvent, FeatureName } from '../../types'
 import getLogger from '../logger'
 import { RecommendExtensionMessage } from '../messaging'
 import {
@@ -47,9 +48,15 @@ import {
   NOTEBOOK_AUTHOR_MODE_ON,
   ClientMessages,
   TELEMETRY_EVENTS,
+  RUNME_FRONTMATTER_PARSED,
 } from '../../constants'
 import ContextState from '../contextState'
 import { createGist } from '../services/github/gist'
+import { InitializeClient } from '../api/client'
+import { GetUserEnvironmentsDocument } from '../__generated-platform__/graphql'
+import { EnvironmentManager } from '../environment/manager'
+import features from '../features'
+import { insertCodeNotebookCell } from '../cell'
 
 const log = getLogger('Commands')
 
@@ -87,9 +94,9 @@ export async function displayCategoriesSelector({
     return
   }
   const category = await window.showQuickPick(categories.sort(), {
-    title: 'Select a category to run.',
+    title: 'Select a tag to run.',
     ignoreFocusOut: true,
-    placeHolder: 'Select a category',
+    placeHolder: 'Select a tag',
   })
   if (!category) {
     return
@@ -104,7 +111,7 @@ export async function runCellsByCategory(cell: NotebookCell, kernel: Kernel) {
   const category = annotations.category
   if (!category) {
     const answer = await window.showInformationMessage(
-      'No category assigned to this cell. Add one in the configuration.',
+      'No tag assigned to this cell. Add one in the configuration.',
       'Configure',
       'Dismiss',
     )
@@ -156,20 +163,70 @@ export function stopBackgroundTask(cell: NotebookCell) {
   terminal.dispose()
 }
 
-export function runCLICommand(extensionBaseUri: Uri, grpcRunner: boolean) {
-  return async function (cell: NotebookCell) {
-    if (cell.notebook.isDirty) {
-      const option = await window.showInformationMessage(
-        'You have unsaved changes. Save and run in CLI?',
-        'Save',
-        'Cancel',
-      )
+async function runStatusCommand(cell: NotebookCell): Promise<boolean> {
+  if (cell.notebook.isDirty) {
+    const option = await window.showInformationMessage(
+      'You have unsaved changes. Save and proceed?',
+      'Save',
+      'Cancel',
+    )
 
-      if (option === 'Cancel' || !option) {
+    if (option === 'Cancel' || !option) {
+      return false
+    }
+
+    await cell.notebook.save()
+  }
+
+  return true
+}
+
+export function runForkCommand(kernel: Kernel, extensionBaseUri: Uri, _grpcRunner: boolean) {
+  return async function (cell: NotebookCell) {
+    if (!warnBetaRequired("Please switch to Runme's runner v2 (beta) to fork into terminals.")) {
+      return
+    }
+
+    if (!(await runStatusCommand(cell))) {
+      return
+    }
+
+    const cwd = path.dirname(cell.document.uri.fsPath)
+
+    const session = await kernel.createTerminalSession(cwd)
+    session.data.then(async (data) => {
+      if (!data.trimEnd().endsWith('save') && data.indexOf('save\r\n') < 0) {
         return
       }
 
-      await cell.notebook.save()
+      await insertCodeNotebookCell({
+        cell,
+        input: data,
+        languageId: 'sh',
+        displayConfirmationDialog: false,
+        background: false,
+        run: false,
+      })
+    })
+
+    const annotations = getAnnotations(cell.metadata)
+    const term = window.createTerminal({
+      name: `Fork: ${annotations.name}`,
+      pty: session,
+      iconPath: {
+        dark: Uri.joinPath(extensionBaseUri, 'assets', 'logo-open-dark.svg'),
+        light: Uri.joinPath(extensionBaseUri, 'assets', 'logo-open-light.svg'),
+      },
+    })
+
+    term.show(false)
+  }
+}
+
+export function runCLICommand(kernel: Kernel, extensionBaseUri: Uri, grpcRunner: boolean) {
+  return async function (cell: NotebookCell) {
+    if (!(await runStatusCommand(cell))) {
+      return
     }
 
     const cwd = path.dirname(cell.document.uri.fsPath)
@@ -211,7 +268,7 @@ export function runCLICommand(extensionBaseUri: Uri, grpcRunner: boolean) {
   }
 }
 
-function openDocumentAs(doc: { text?: TextDocument; notebook?: NotebookDocument }) {
+async function openDocumentAs(doc: { text?: TextDocument; notebook?: NotebookDocument }) {
   const openIn = getActionsOpenViewInEditor()
   switch (openIn) {
     case OpenViewInEditorAction.enum.toggle:
@@ -222,11 +279,11 @@ function openDocumentAs(doc: { text?: TextDocument; notebook?: NotebookDocument 
     default:
       {
         if (doc.notebook) {
-          window.showNotebookDocument(doc.notebook, {
+          await window.showNotebookDocument(doc.notebook, {
             viewColumn: ViewColumn.Active,
           })
         } else if (doc.text) {
-          window.showTextDocument(doc.text, {
+          await window.showTextDocument(doc.text, {
             viewColumn: ViewColumn.Beside,
           })
         }
@@ -235,12 +292,14 @@ function openDocumentAs(doc: { text?: TextDocument; notebook?: NotebookDocument 
   }
 }
 
-export function openAsRunmeNotebook(doc: NotebookDocument) {
-  openDocumentAs({ notebook: doc })
+export async function openAsRunmeNotebook(uri: Uri) {
+  const notebook = await workspace.openNotebookDocument(uri)
+  await openDocumentAs({ notebook })
 }
 
-export function openSplitViewAsMarkdownText(doc: TextDocument) {
-  openDocumentAs({ text: doc })
+export async function openSplitViewAsMarkdownText(uri: Uri) {
+  const text = await workspace.openTextDocument(uri)
+  await openDocumentAs({ text })
 }
 
 export async function askNewRunnerSession(kernel: Kernel) {
@@ -272,7 +331,7 @@ export async function askAlternativeOutputsAction(
   )
 
   const orig =
-    metadata['runme.dev/frontmatterParsed']?.['runme']?.['session']?.['document']?.['relativePath']
+    metadata[RUNME_FRONTMATTER_PARSED]?.['runme']?.['session']?.['document']?.['relativePath']
 
   switch (action) {
     case ASK_ALT_OUTPUTS_ACTION.ORIGINAL:
@@ -351,7 +410,9 @@ export async function addToRecommendedExtensions(context: ExtensionContext) {
 }
 
 export async function toggleAutosave(autoSaveIsOn: boolean) {
-  if (autoSaveIsOn && isRunmeAppButtonsEnabled()) {
+  const createIfNone = features.isOnInContextState(FeatureName.ForceLogin)
+
+  if (autoSaveIsOn && createIfNone) {
     await promptUserSession()
   }
   return ContextState.addKey(NOTEBOOK_AUTOSAVE_ON, autoSaveIsOn)
@@ -361,9 +422,9 @@ export async function toggleMasking(maskingIsOn: boolean): Promise<void> {
   ContextState.addKey(NOTEBOOK_OUTPUTS_MASKED, maskingIsOn)
 }
 
-export async function runCellWithPrompts() {
+export async function runCellWithPrompts(cell: NotebookCell, kernel: Kernel) {
   await ContextState.addKey(NOTEBOOK_RUN_WITH_PROMPTS, true)
-  await commands.executeCommand('notebook.cell.execute')
+  await kernel.executeAndFocusNotebookCell(cell)
   await ContextState.addKey(NOTEBOOK_RUN_WITH_PROMPTS, false)
 }
 
@@ -379,7 +440,9 @@ export async function createGistCommand(e: NotebookUiEvent, context: ExtensionCo
     const bytes = await workspace.fs.readFile(uri)
     const templatePath = Uri.joinPath(context.extensionUri, 'templates', 'gist.md')
     const byRunmeFile = await workspace.fs.readFile(templatePath)
-    const [originalFileName, sessionId] = fileName.split('-')
+    const fileNameParts = fileName.split('-')
+    const sessionId = fileNameParts.pop() as string
+    const originalFileName = fileNameParts.join('-')
 
     const createGistProgress = await window.withProgress(
       {
@@ -391,14 +454,14 @@ export async function createGistCommand(e: NotebookUiEvent, context: ExtensionCo
         const createdGist = await createGist({
           isPublic: false,
           files: {
-            [sessionId]: {
+            [fileName]: {
+              content: Buffer.from(bytes).toString('utf8'),
+            },
+            [`summary-${sessionId}`]: {
               content: Buffer.from(byRunmeFile)
                 .toString('utf8')
                 .replaceAll('%%file%%', `${originalFileName}.md`)
                 .replaceAll('%%session%%', sessionId.replace('.md', '')),
-            },
-            [fileName]: {
-              content: Buffer.from(bytes).toString('utf8'),
             },
           },
         })
@@ -414,7 +477,7 @@ export async function createGistCommand(e: NotebookUiEvent, context: ExtensionCo
     )
 
     if (option === 'Open') {
-      env.openExternal(Uri.parse(`${createGistProgress.data?.html_url}#file-${fileName}`))
+      env.openExternal(Uri.parse(`${createGistProgress.data?.html_url}`))
     }
   } catch (error) {
     gitShared = false
@@ -446,7 +509,9 @@ export async function createCellGistCommand(cell: NotebookCell, context: Extensi
     const cellGistTemplate = await workspace.fs.readFile(
       Uri.joinPath(context.extensionUri, 'templates', 'cellGist.md'),
     )
-    const [originalFileName, sessionId] = fileName.split('-')
+    const fileNameParts = fileName.split('-')
+    const sessionId = fileNameParts.pop() as string
+    const originalFileName = fileNameParts.join('-')
     const cellId = cell.notebook.metadata['runme.dev/id']
     const markdownId = cellId ? `${cellId}.md` : sessionId
 
@@ -461,16 +526,16 @@ export async function createCellGistCommand(cell: NotebookCell, context: Extensi
           isPublic: false,
           files: {
             [`${markdownId}`]: {
-              content: Buffer.from(byRunmeFile)
-                .toString('utf8')
-                .replaceAll('%%file%%', `${originalFileName}.md`)
-                .replaceAll('%%session%%', sessionId.replace('.md', '')),
-            },
-            [`cell-${markdownId}`]: {
               content: Buffer.from(cellGistTemplate)
                 .toString('utf8')
                 .replaceAll('%%cell_text%%', cell.document.getText())
                 .replaceAll('%%language%%', cell.document.languageId),
+            },
+            [`summary-${markdownId}`]: {
+              content: Buffer.from(byRunmeFile)
+                .toString('utf8')
+                .replaceAll('%%file%%', `${originalFileName}.md`)
+                .replaceAll('%%session%%', sessionId.replace('.md', '')),
             },
           },
         })
@@ -486,7 +551,7 @@ export async function createCellGistCommand(cell: NotebookCell, context: Extensi
     )
 
     if (option === 'Open') {
-      env.openExternal(Uri.parse(`${createGistProgress.data?.html_url}#file-${fileName}`))
+      env.openExternal(Uri.parse(`${createGistProgress.data?.html_url}`))
     }
   } catch (error) {
     gitShared = false
@@ -495,5 +560,38 @@ export async function createCellGistCommand(cell: NotebookCell, context: Extensi
     TelemetryReporter.sendTelemetryEvent(TELEMETRY_EVENTS.CellGist, {
       error: gitShared.toString(),
     })
+  }
+}
+
+export async function selectEnvironment(manager: EnvironmentManager) {
+  const session = await getPlatformAuthSession()
+  const graphClient = InitializeClient({ runmeToken: session?.accessToken! })
+
+  const result = await graphClient.query({
+    query: GetUserEnvironmentsDocument,
+  })
+
+  const options = result.data.userEnvironments.map((env) => ({
+    id: env.id,
+    label: env.name,
+    description: env.description || '',
+  }))
+
+  options.push({
+    id: '',
+    label: 'None',
+    description: '',
+  })
+
+  const selected = await window.showQuickPick(options, {
+    placeHolder: 'Select an environment',
+    canPickMany: false,
+  })
+  if (selected) {
+    const isEnv = !!selected.id
+    manager.setEnvironment(isEnv ? selected : null)
+    window.showInformationMessage(
+      isEnv ? `Selected environment: ${selected.label}` : 'Environment cleared',
+    )
   }
 }

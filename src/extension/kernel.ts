@@ -1,4 +1,5 @@
 import path from 'node:path'
+import os from 'node:os'
 
 import {
   Disposable,
@@ -21,14 +22,22 @@ import {
   NotebookEditorRevealType,
   NotebookEditorSelectionChangeEvent,
   CancellationToken,
+  NotebookData,
+  version,
+  NotebookCellData,
 } from 'vscode'
 import { TelemetryReporter } from 'vscode-telemetry'
+import { UnaryCall } from '@protobuf-ts/runtime-rpc'
+import { map } from 'rxjs/operators'
 
 import {
   type ActiveTerminal,
   type ClientMessage,
   type RunmeTerminal,
   type Serializer,
+  type ExtensionName,
+  type FeatureContext,
+  FeatureName,
 } from '../types'
 import {
   ClientMessages,
@@ -38,20 +47,23 @@ import {
   CATEGORY_SEPARATOR,
   NOTEBOOK_MODE,
   NotebookMode,
+  OutputType,
 } from '../constants'
 import { API } from '../utils/deno/api'
 import { postClientMessage } from '../utils/messaging'
-import {
-  getNotebookExecutionOrder,
-  isPlatformAuthEnabled,
-  registerExtensionEnvVarsMutation,
-} from '../utils/configuration'
+import { getNotebookExecutionOrder, registerExtensionEnvVarsMutation } from '../utils/configuration'
+import features, { FEATURES_CONTEXT_STATE_KEY } from '../features'
 
 import getLogger from './logger'
-import executor, { type IEnvironmentManager, ENV_STORE_MANAGER, IKernelExecutor } from './executors'
+import executor, {
+  type IEnvironmentManager,
+  ENV_STORE_MANAGER,
+  IKernelExecutor,
+  IKernelExecutorOptions,
+} from './executors'
 import { DENO_ACCESS_TOKEN_KEY } from './constants'
 import {
-  getKey,
+  getKeyInfo,
   getAnnotations,
   hashDocumentUri,
   processEnviron,
@@ -62,27 +74,30 @@ import {
   handleNotebookAutosaveSettings,
   getWorkspaceFolder,
   getRunnerSessionEnvs,
+  getEnvProps,
+  warnBetaRequired,
 } from './utils'
+import { getEventReporter } from './ai/events'
 import { getSystemShellPath, isShellLanguage } from './executors/utils'
 import './wasm/wasm_exec.js'
-import { RpcError } from './grpc/client'
-import { IRunner, IRunnerReady } from './runner'
+import { RpcError, TransformRequest, TransformResponse } from './grpc/client'
+import { IRunner, IRunnerReady, RunProgramOptions } from './runner'
 import { IRunnerEnvironment } from './runner/environment'
-import { executeRunner } from './executors/runner'
+import { IKernelRunnerOptions, executeRunner } from './executors/runner'
 import { ITerminalState, NotebookTerminalType } from './terminal/terminalState'
 import {
   NotebookCellManager,
   NotebookCellOutputManager,
   RunmeNotebookCellExecution,
   getCellById,
+  insertCodeCell,
 } from './cell'
 import { handleCellOutputMessage } from './messages/cellOutput'
 import handleGitHubMessage, { handleGistMessage } from './messages/github'
 import { getNotebookCategories } from './utils'
-import { handleCloudApiMessage } from './messages/cloudApiRequest'
 import PanelManager from './panels/panelManager'
-import { GrpcSerializer } from './serializer'
-import { askAlternativeOutputsAction } from './commands'
+import { GrpcSerializer, SerializerBase } from './serializer'
+import { askAlternativeOutputsAction, openSplitViewAsMarkdownText } from './commands'
 import { handlePlatformApiMessage } from './messages/platformRequest'
 import { handleGCPMessage } from './messages/gcp'
 import { IPanel } from './panels/base'
@@ -90,6 +105,9 @@ import { handleAWSMessage } from './messages/aws'
 import EnvVarsChangedEvent from './events/envVarsChanged'
 import { SessionEnvStoreType } from './grpc/runner/v1'
 import ContextState from './contextState'
+import { uri as runUriResource } from './executors/resource'
+import { CommandModeEnum } from './grpc/runner/types'
+import { GrpcReporter } from './reporter'
 
 enum ConfirmationItems {
   Yes = 'Yes',
@@ -104,6 +122,7 @@ export class Kernel implements Disposable {
   static readonly type = 'runme' as const
 
   readonly #experiments = new Map<string, boolean>()
+  readonly #featuresSettings = new Map<string, boolean>()
 
   #disposables: Disposable[] = []
   #controller = notebooks.createNotebookController(
@@ -122,6 +141,9 @@ export class Kernel implements Disposable {
   protected activeTerminals: ActiveTerminal[] = []
   protected category?: string
   protected panelManager: PanelManager
+  protected serializer?: SerializerBase
+  protected reporter?: GrpcReporter
+  protected featuresState$?
 
   readonly onVarsChangeEvent: EnvVarsChangedEvent
 
@@ -129,12 +151,12 @@ export class Kernel implements Disposable {
     const config = workspace.getConfiguration('runme.experiments')
 
     this.onVarsChangeEvent = new EnvVarsChangedEvent()
-
     this.#experiments.set('grpcSerializer', config.get<boolean>('grpcSerializer', true))
     this.#experiments.set('grpcRunner', config.get<boolean>('grpcRunner', true))
     this.#experiments.set('grpcServer', config.get<boolean>('grpcServer', true))
-    this.#experiments.set('escalationButton', config.get<boolean>('escalationButton', false))
     this.#experiments.set('smartEnvStore', config.get<boolean>('smartEnvStore', false))
+    this.#experiments.set('shellWarning', config.get<boolean>('shellWarning', false))
+    this.#experiments.set('reporter', config.get<boolean>('reporter', false))
 
     this.cellManager = new NotebookCellManager(this.#controller)
     this.#controller.supportsExecutionOrder = getNotebookExecutionOrder()
@@ -157,6 +179,7 @@ export class Kernel implements Disposable {
 
     this.messaging.postMessage({ from: 'kernel' })
     this.panelManager = new PanelManager(context)
+
     this.#disposables.push(
       this.messaging.onDidReceiveMessage(this.#handleRendererMessage.bind(this)),
       workspace.onDidOpenNotebookDocument(this.#handleOpenNotebook.bind(this)),
@@ -167,6 +190,63 @@ export class Kernel implements Disposable {
       this.onVarsChangeEvent,
       this.registerTerminalProfile(),
     )
+
+    const packageJSON = context?.extension?.packageJSON || {}
+    const featContext: FeatureContext = {
+      os: os.platform(),
+      vsCodeVersion: version as string,
+      extensionVersion: packageJSON?.version,
+      githubAuth: false,
+      statefulAuth: false,
+      extensionId: context?.extension?.id as ExtensionName,
+    }
+
+    const runmeFeatureSettings = workspace.getConfiguration('runme.features')
+    const featureNames = Object.keys(FeatureName)
+
+    featureNames.forEach((feature) => {
+      if (runmeFeatureSettings.has(feature)) {
+        const result = runmeFeatureSettings.get<boolean>(feature, false)
+        this.#featuresSettings.set(feature, result)
+      }
+    })
+
+    this.featuresState$ = features.loadState(packageJSON, featContext, this.#featuresSettings)
+
+    if (this.featuresState$) {
+      const subscription = this.featuresState$
+        .pipe(map((_state) => features.getSnapshot(this.featuresState$)))
+        .subscribe((snapshot) => {
+          ContextState.addKey(FEATURES_CONTEXT_STATE_KEY, snapshot)
+          postClientMessage(this.messaging, ClientMessages.featuresUpdateAction, {
+            snapshot: snapshot,
+          })
+        })
+
+      this.#disposables.push({
+        dispose: () => subscription.unsubscribe(),
+      })
+    }
+  }
+
+  get envProps() {
+    const ext = {
+      id: this.context!.extension.id,
+      version: this.context!.extension.packageJSON.version,
+    }
+    return getEnvProps(ext)
+  }
+
+  isFeatureOn(featureName: FeatureName): boolean {
+    if (!this.featuresState$) {
+      return false
+    }
+
+    return features.isOn(featureName, this.featuresState$)
+  }
+
+  updateFeatureContext<K extends keyof FeatureContext>(key: K, value: FeatureContext[K]) {
+    features.updateContext(this.featuresState$, key, value, this.#featuresSettings)
   }
 
   registerNotebookCell(cell: NotebookCell) {
@@ -174,6 +254,14 @@ export class Kernel implements Disposable {
   }
   setCategory(category: string) {
     this.category = category
+  }
+
+  setSerializer(serializer: GrpcSerializer) {
+    this.serializer = serializer
+  }
+
+  setReporter(reporter: GrpcReporter) {
+    this.reporter = reporter
   }
 
   hasExperimentEnabled(key: string, defaultValue?: boolean) {
@@ -190,6 +278,18 @@ export class Kernel implements Disposable {
 
   async getTerminalState(cell: NotebookCell): Promise<ITerminalState | undefined> {
     return (await this.getCellOutputs(cell)).getCellTerminalState()
+  }
+
+  async saveOutputState(cell: NotebookCell, type: OutputType, value: any) {
+    const cellId = cell.metadata?.['runme.dev/id']
+    const outputs = await this.getCellOutputs(cell)
+    outputs.saveOutputState(cellId, type, value)
+  }
+
+  async cleanOutputState(cell: NotebookCell, type: OutputType) {
+    const cellId = cell.metadata?.['runme.dev/id']
+    const outputs = await this.getCellOutputs(cell)
+    outputs.cleanOutputState(cellId, type)
   }
 
   async registerCellTerminalState(
@@ -235,12 +335,27 @@ export class Kernel implements Disposable {
     }
     await this.#setNotebookMode(notebookDocument)
     getCells().forEach((cell) => this.registerNotebookCell(cell))
-    const availableCategories = new Set<string>([
-      ...getCells()
-        .map((cell) => getAnnotations(cell).category.split(CATEGORY_SEPARATOR))
-        .flat()
-        .filter((c) => c.length > 0),
-    ])
+
+    let availableCategories = new Set<string>()
+    try {
+      availableCategories = new Set<string>([
+        ...getCells()
+          .map((cell) => getAnnotations(cell).category.split(CATEGORY_SEPARATOR))
+          .flat()
+          .filter((c) => c.length > 0),
+      ])
+    } catch (err) {
+      if (err instanceof Error) {
+        const action = 'Edit Markdown'
+        const taken = await window.showErrorMessage(
+          `Failed to retrieve cell annotations in markdown; possibly invalid: ${err.message}`,
+          action,
+        )
+        if (taken && taken === action) {
+          openSplitViewAsMarkdownText(notebookDocument.uri)
+        }
+      }
+    }
 
     await setNotebookCategories(this.context, uri, availableCategories)
     const isReadme = uri.fsPath.toUpperCase().includes('README')
@@ -272,12 +387,6 @@ export class Kernel implements Disposable {
     editor: NotebookEditor
     message: ClientMessage<ClientMessages>
   }) {
-    // Check if the message type is a cloud API request and platform authentication is enabled.
-    if (message.type === ClientMessages.cloudApiRequest && isPlatformAuthEnabled()) {
-      // Remap the message type to platform API request if platform authentication is enabled.
-      message = { ...message, type: ClientMessages.platformApiRequest }
-    }
-
     if (message.type === ClientMessages.mutateAnnotations) {
       const payload = message as ClientMessage<ClientMessages.mutateAnnotations>
 
@@ -413,13 +522,6 @@ export class Kernel implements Disposable {
         editor,
         kernel: this,
       })
-    } else if (message.type === ClientMessages.cloudApiRequest) {
-      return handleCloudApiMessage({
-        messaging: this.messaging,
-        message,
-        editor,
-        kernel: this,
-      })
     } else if (message.type === ClientMessages.optionsModal) {
       if (message.output.telemetryEvent) {
         TelemetryReporter.sendTelemetryEvent(message.output.telemetryEvent)
@@ -469,10 +571,16 @@ export class Kernel implements Disposable {
         ClientMessages.gcpClusterDetails,
         ClientMessages.gcpClusterDetailsNewCell,
         ClientMessages.gcpVMInstanceAction,
+        ClientMessages.gcpCloudRunAction,
+        ClientMessages.gcpLoadServices,
       ].includes(message.type)
     ) {
       return handleGCPMessage({ messaging: this.messaging, message, editor })
-    } else if ([ClientMessages.awsEC2InstanceAction].includes(message.type)) {
+    } else if (
+      [ClientMessages.awsEC2InstanceAction, ClientMessages.awsEKSClusterAction].includes(
+        message.type,
+      )
+    ) {
       return handleAWSMessage({ messaging: this.messaging, message, editor })
     } else if (message.type === ClientMessages.gistCell) {
       TelemetryReporter.sendRawTelemetryEvent(message.output.telemetryEvent)
@@ -481,7 +589,57 @@ export class Kernel implements Disposable {
         editor,
         message,
       })
+    } else if (message.type === ClientMessages.daggerCliAction) {
+      let args: string[] = []
+      switch (message.output.argument) {
+        case 'path':
+          if (!message.output.command.trimEnd().includes('export')) {
+            const remotePath = await window.showInputBox({
+              title: 'Specify path please',
+            })
+            if (!remotePath) {
+              return
+            }
+            args.push('--path')
+            args.push(remotePath || '')
+            break
+          }
+
+          const loc = await window.showSaveDialog({
+            title: 'Specify path please',
+          })
+          if (loc) {
+            args.push('--path')
+            const dir = path.dirname(editor.notebook.uri.fsPath)
+            const idx = loc.fsPath.lastIndexOf(dir)
+            if (idx >= 0) {
+              args.push(loc.fsPath.substring(idx + dir.length + 1))
+            } else {
+              args.push(loc.fsPath)
+            }
+            break
+          }
+          return
+        case 'address':
+          const address = await window.showInputBox({
+            prompt: 'Specify the address please',
+          })
+          if (address) {
+            args.push('--address')
+            args.push(address)
+            break
+          }
+          return
+      }
+      const cellText = `${message.output.command} ${args.join(' ')}`
+      return insertCodeCell(message.output.cellId, editor, cellText, 'sh', false)
     } else if (message.type.startsWith('terminal:')) {
+      return
+    } else if (message.type === ClientMessages.featuresRequest) {
+      const snapshot = features.getSnapshot(this.featuresState$)
+      postClientMessage(this.messaging, ClientMessages.featuresResponse, {
+        snapshot: snapshot,
+      })
       return
     }
 
@@ -510,14 +668,21 @@ export class Kernel implements Disposable {
 
     for (const cell of cells) {
       const annotations = getAnnotations(cell)
+
+      // Skip cells that are not assigned to requested category if requested
       if (
-        (totalCellsToExecute > 1 &&
-          this.category &&
-          !annotations.category.split(CATEGORY_SEPARATOR).includes(this.category)) ||
-        annotations.excludeFromRunAll
+        totalCellsToExecute > 1 &&
+        this.category &&
+        !annotations.category.split(CATEGORY_SEPARATOR).includes(this.category)
       ) {
         continue
       }
+
+      // skip cells that are excluded from run all
+      if (totalCellsToExecute > 1 && annotations.excludeFromRunAll) {
+        continue
+      }
+
       if (showConfirmPrompt) {
         const cellText = cell.document.getText()
         const cellLabel =
@@ -575,7 +740,7 @@ export class Kernel implements Disposable {
     return await this.cellManager.getNotebookOutputs(cell)
   }
 
-  private async openAndWaitForTextDocument(uri: Uri): Promise<TextDocument | undefined> {
+  public async openAndWaitForTextDocument(uri: Uri): Promise<TextDocument | undefined> {
     let textDocument = await workspace.openTextDocument(uri)
     if (!textDocument) {
       textDocument = await new Promise((resolve) => {
@@ -609,113 +774,202 @@ export class Kernel implements Disposable {
 
     TelemetryReporter.sendTelemetryEvent('cell.startExecute')
     runmeExec.start(Date.now())
-    let execKey = getKey(runningCell)
+
+    const annotations = getAnnotations(cell)
+    const { key: execKey, resource } = getKeyInfo(runningCell, annotations)
 
     let successfulCellExecution: boolean
 
     const envMgr = this.getEnvironmentManager()
     const outputs = await this.getCellOutputs(cell)
 
-    if (
-      this.runner &&
-      // hard disable gRPC runner on windows
-      // TODO(mxs): support windows shells
-      !isWindows()
-    ) {
-      const runScript = (key: string = execKey) =>
-        executeRunner({
-          kernel: this,
-          doc: cell.document,
-          context: this.context,
-          runner: this.runner!,
-          exec,
-          runningCell,
-          messaging: this.messaging,
-          cellId: id,
-          execKey: key,
-          outputs,
-          runnerEnv: this.runnerEnv,
-          envMgr,
-        }).catch((e) => {
-          if (e instanceof RpcError) {
-            if (e.message.includes('invalid LanguageId')) {
-              // todo(sebastian): provide "Configure" button to trigger foldout
-              window
-                .showWarningMessage(
-                  // eslint-disable-next-line max-len
-                  'Not every language is automatically executable. ' +
-                    'Click below to learn what language runtimes are auto-detected. ' +
-                    'You can also set an "interpreter" in the "Configure" foldout to define how this cell executes.',
-                  'See Auto-Detected Languages',
-                )
-                .then((link) => {
-                  if (!link) {
-                    return
-                  }
-                  TelemetryReporter.sendTelemetryEvent('survey.shebangAutoDetectRedirect', {})
-                  commands.executeCommand(
-                    'vscode.open',
-                    Uri.parse('https://runme.dev/redirect/shebang-auto-detect'),
-                  )
-                })
-              return false
-            }
-
-            if (e.message.includes('invalid ProgramName')) {
-              window.showErrorMessage(
-                // eslint-disable-next-line max-len
-                'Unable to locate interpreter specified in shebang (aka #!). Please check the cell\'s "Configure" foldout.',
-              )
-              return false
-            }
-          }
-
-          window.showErrorMessage(`Internal failure executing runner: ${e.message}`)
-          log.error('Internal failure executing runner', e.message)
-          return false
-        })
-
-      if (isShellLanguage(execKey) || !(execKey in executor)) {
-        successfulCellExecution = await runScript(execKey)
-      } else {
-        const executorByKey: IKernelExecutor = executor[execKey as keyof typeof executor]
-        successfulCellExecution = await executorByKey({
-          context: this.context,
-          kernel: this,
-          doc: runningCell,
-          exec,
-          outputs,
-          messaging: this.messaging,
-          envMgr,
-          runScript,
-        })
-      }
-    } else if (execKey in executor) {
-      /**
-       * check if user is running experiment to execute shell via runme cli
-       */
-      const executorByKey: IKernelExecutor = executor[execKey as keyof typeof executor]
-      successfulCellExecution = await executorByKey({
-        context: this.context,
-        kernel: this,
-        doc: runningCell,
-        exec,
-        outputs,
-        messaging: this.messaging,
-        envMgr,
-      })
-    } else {
-      window.showErrorMessage('Cell language is not executable')
-
-      successfulCellExecution = false
+    const runnerOpts: IKernelRunnerOptions = {
+      kernel: this,
+      doc: cell.document,
+      context: this.context,
+      runner: this.runner!,
+      exec,
+      runningCell,
+      messaging: this.messaging,
+      cellId: id,
+      execKey,
+      outputs,
+      runnerEnv: this.runnerEnv,
+      envMgr,
+      resource,
     }
-    const annotations = getAnnotations(cell)
+
+    const executorOpts: IKernelExecutorOptions = {
+      context: this.context,
+      kernel: this,
+      runner: this.runner,
+      runnerEnv: this.runnerEnv,
+      doc: runningCell,
+      exec,
+      outputs,
+      messaging: this.messaging,
+      envMgr,
+      resource,
+      cellText: runningCell.getText(),
+    }
+
+    try {
+      successfulCellExecution = await this.executeCell(runnerOpts, executorOpts)
+    } catch (e: any) {
+      successfulCellExecution = false
+      log.error('Error executing cell', e.message)
+      window.showErrorMessage(e.message)
+    }
+
+    // todo(sebastian): rewrite to use non-blocking impl
+    const execCellReport = getEventReporter().reportExecution(cell, successfulCellExecution)
+    await execCellReport
 
     TelemetryReporter.sendTelemetryEvent('cell.endExecute', {
       'cell.success': successfulCellExecution?.toString(),
       'cell.mimeType': annotations.mimeType,
     })
     runmeExec.end(successfulCellExecution, Date.now())
+  }
+
+  private async executeCell(
+    runnerOpts: IKernelRunnerOptions,
+    executorOpts: IKernelExecutorOptions,
+  ): Promise<boolean> {
+    // hard disable gRPC runner on windows
+    // TODO(sebastian): support windows shells?
+    const supportsGrpcRunner = this.runner && !isWindows()
+
+    const execKey = runnerOpts.execKey
+    const hasExecutor = execKey in executor
+
+    if (
+      supportsGrpcRunner &&
+      (isShellLanguage(execKey) || !hasExecutor) &&
+      executorOpts.resource === 'None'
+    ) {
+      return this.executeRunnerSafe(runnerOpts)
+    }
+
+    /**
+     * error if no custom notebook executor + renderer is available
+     */
+    if (!hasExecutor) {
+      throw Error('Cell language is not executable')
+    }
+
+    const executorByKey: IKernelExecutor = executor[execKey as keyof typeof executor]
+    if (executorOpts.resource === 'URI' && supportsGrpcRunner) {
+      const runScript = (text?: string) => {
+        const cellText = text || executorOpts.cellText
+        return executorByKey({ ...executorOpts, cellText })
+      }
+      const opts: IKernelRunnerOptions = {
+        ...runnerOpts,
+        runScript,
+      }
+      return runUriResource(opts)
+    }
+
+    if (execKey === 'dagger' && supportsGrpcRunner) {
+      const notify = async (res?: string): Promise<boolean> => {
+        try {
+          const daggerJsonParsed = JSON.parse(res || '{}')
+          daggerJsonParsed.runme = { cellText: runnerOpts.runningCell.getText() }
+          await this.saveOutputState(runnerOpts.exec.cell, OutputType.dagger, {
+            json: JSON.stringify(daggerJsonParsed),
+          })
+
+          return new Promise<boolean>((resolve) => {
+            this.messaging
+              .postMessage(<ClientMessage<ClientMessages.daggerSyncState>>{
+                type: ClientMessages.daggerSyncState,
+                output: {
+                  id: runnerOpts.cellId,
+                  cellId: runnerOpts.cellId,
+                  json: daggerJsonParsed,
+                },
+              })
+              .then(() => resolve(true))
+          })
+        } catch (e) {
+          // not a fatal error
+          if (e instanceof Error) {
+            console.error(e.message)
+          }
+
+          await this.saveOutputState(runnerOpts.exec.cell, OutputType.dagger, {
+            text: res,
+          })
+
+          return new Promise<boolean>((resolve) => {
+            this.messaging
+              .postMessage(<ClientMessage<ClientMessages.daggerSyncState>>{
+                type: ClientMessages.daggerSyncState,
+                output: {
+                  id: runnerOpts.cellId,
+                  cellId: runnerOpts.cellId,
+                  text: res,
+                },
+              })
+              .then(() => resolve(true))
+          })
+        }
+      }
+      const runSecondary = () => {
+        return runUriResource({ ...runnerOpts, runScript: notify })
+      }
+      this.cleanOutputState(runnerOpts.exec.cell, OutputType.dagger)
+      return this.executeRunnerSafe({ ...runnerOpts, runScript: runSecondary })
+    }
+
+    return executorByKey(executorOpts)
+  }
+
+  private async executeRunnerSafe(executor: IKernelRunnerOptions): Promise<boolean> {
+    return executeRunner(executor).catch((e) => {
+      if (e instanceof RpcError) {
+        if (e.message.includes('invalid LanguageId')) {
+          // todo(sebastian): provide "Configure" button to trigger foldout
+          window
+            .showWarningMessage(
+              // eslint-disable-next-line max-len
+              'Not every language is automatically executable. ' +
+                'Click below to learn what language runtimes are auto-detected. ' +
+                'You can also set an "interpreter" in the "Configure" foldout to define how this cell executes.',
+              'See Auto-Detected Languages',
+            )
+            .then((link) => {
+              if (!link) {
+                return
+              }
+              TelemetryReporter.sendTelemetryEvent('survey.shebangAutoDetectRedirect', {})
+              commands.executeCommand(
+                'vscode.open',
+                Uri.parse('https://runme.dev/redirect/shebang-auto-detect'),
+              )
+            })
+          return false
+        }
+
+        // cover runnerv1 and v2
+        if (
+          e.message.includes('invalid ProgramName') ||
+          e.message.includes('failed program lookup') ||
+          e.message.includes('unable to locate program')
+        ) {
+          window.showErrorMessage(
+            // eslint-disable-next-line max-len
+            'Unable to locate interpreter specified in shebang (aka #!). Please check the cell\'s "Configure" foldout.',
+          )
+          return false
+        }
+      }
+
+      window.showErrorMessage(`Internal failure executing runner: ${e.message}`)
+      log.error('Internal failure executing runner', e.message)
+      return false
+    })
   }
 
   useRunner(runner: IRunner) {
@@ -742,7 +996,8 @@ export class Kernel implements Disposable {
       return
     }
 
-    this.address = address
+    // keep old address unless there's a new one
+    this.address = address || this.address
 
     log.info('Requesting new runner environment.')
 
@@ -768,7 +1023,7 @@ export class Kernel implements Disposable {
 
       registerExtensionEnvVarsMutation(
         this.context,
-        getRunnerSessionEnvs(this.context.extensionUri, runnerEnv, address),
+        getRunnerSessionEnvs(this.context, runnerEnv, true, address),
       )
 
       const monitor = await this.runner.createMonitorEnvStore()
@@ -835,40 +1090,79 @@ export class Kernel implements Disposable {
 
   registerTerminalProfile(): Disposable {
     const kernel = this
-    const baseUri = workspace.workspaceFolders![0].uri
-    const cwd = baseUri.fsPath
+    const baseUri = workspace.workspaceFolders?.[0].uri
+    const cwd = baseUri?.fsPath
 
     return window.registerTerminalProfileProvider('runme.terminalProfile', {
       async provideTerminalProfile(
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
         token: CancellationToken,
       ) {
-        const runner = kernel.runner!
-        // todo(sebastian): why are the env collection mutations not doing this?
-        const envsRecords = getRunnerSessionEnvs(
-          kernel.context.extensionUri,
-          kernel.runnerEnv,
-          kernel.address,
-        )
-        const sysShell = getSystemShellPath() || '/bin/bash'
-        const program = await runner.createProgramSession({
-          programName: `${sysShell} -l`,
-          tty: true,
-          cwd,
-          envs: Object.entries(envsRecords).map(([k, v]) => `${k}=${v}`),
-        })
+        if (!warnBetaRequired("Please switch to Runme's runner v2 (beta) to use Runme Terminal.")) {
+          throw new Error('Runme terminal requires runner v2')
+        }
 
-        program.registerTerminalWindow('vscode')
-        program.setActiveTerminalWindow('vscode')
+        const session = await kernel.createTerminalSession(cwd)
+        const sid = kernel.runnerEnv?.getSessionId()
+
+        session.data.then(async (data) => {
+          if (!data.trimEnd().endsWith('save') && data.indexOf('save\r\n') < 0) {
+            return
+          }
+
+          const sessionNotebook = await workspace.openNotebookDocument(
+            Kernel.type,
+            new NotebookData([
+              new NotebookCellData(
+                NotebookCellKind.Markup,
+                // eslint-disable-next-line max-len
+                '# Terminal Session\n\nThe following cell contains a copy (best-effort) of your recent terminal session.',
+                'markdown',
+              ),
+              new NotebookCellData(NotebookCellKind.Code, data, 'sh'),
+              new NotebookCellData(
+                NotebookCellKind.Markup,
+                '*Read the docs on [runme.dev](https://runme.dev/docs/intro)' +
+                  ' to learn how to get most out of Runme notebooks!*',
+                'markdown',
+              ),
+            ]),
+          )
+          await commands.executeCommand('vscode.openWith', sessionNotebook.uri, Kernel.type)
+        })
 
         return {
           options: {
-            name: 'Runme Terminal',
-            pty: program,
+            name: `Runme Terminal ${sid ? `(${sid})` : ''}`,
+            pty: session,
+            iconPath: {
+              dark: Uri.joinPath(kernel.context.extensionUri, 'assets', 'logo-open-dark.svg'),
+              light: Uri.joinPath(kernel.context.extensionUri, 'assets', 'logo-open-light.svg'),
+            },
           },
         }
       },
     })
+  }
+
+  async createTerminalSession(cwd: string | undefined) {
+    const runner = this.runner!
+    // todo(sebastian): why are the env collection mutations not doing this?
+    const envVars = getRunnerSessionEnvs(this.context, this.runnerEnv, false, this.address)
+    const sysShell = getSystemShellPath() || '/bin/bash'
+    const session = await runner.createTerminalSession({
+      programName: `${sysShell} -l`,
+      tty: true,
+      cwd,
+      runnerEnv: this.runnerEnv,
+      envs: Object.entries(envVars).map(([k, v]) => `${k}=${v}`),
+      commandMode: CommandModeEnum().TERMINAL,
+    })
+
+    session.registerTerminalWindow('vscode')
+    session.setActiveTerminalWindow('vscode')
+
+    return session
   }
 
   getTerminal(runmeId: string) {
@@ -917,5 +1211,108 @@ export class Kernel implements Disposable {
 
     await commands.executeCommand('notebook.cell.execute')
     await commands.executeCommand('notebook.cell.focusInOutput')
+  }
+
+  public getMaskedCache(cacheId: string): Promise<Uint8Array> | undefined {
+    return this.serializer?.getMaskedCache(cacheId)
+  }
+
+  public getPlainCache(cacheId: string): Promise<Uint8Array> | undefined {
+    return this.serializer?.getPlainCache(cacheId)
+  }
+
+  public getNotebookDataCache(cacheId: string): NotebookData | undefined {
+    return this.serializer?.getNotebookDataCache(cacheId)
+  }
+
+  public getReporterPayload(
+    input: TransformRequest,
+  ): UnaryCall<TransformRequest, TransformResponse> | undefined {
+    return this.reporter?.transform(input)
+  }
+
+  async runProgram(program?: RunProgramOptions | string) {
+    let programOptions: RunProgramOptions
+    const logger = getLogger('runProgram')
+
+    if (!this.runner) {
+      logger.error('No runner available')
+      return false
+    }
+
+    if (typeof program === 'object') {
+      programOptions = program
+    } else if (typeof program === 'string') {
+      programOptions = {
+        programName: 'bash',
+        background: false,
+        exec: {
+          type: 'script',
+          script: program,
+        },
+        languageId: 'sh',
+        commandMode: CommandModeEnum().INLINE_SHELL,
+        storeLastOutput: false,
+        tty: false,
+      }
+    } else {
+      logger.error('Invalid program options')
+      return
+    }
+
+    const programSession = await this.runner.createProgramSession(programOptions)
+
+    this.context.subscriptions.push(programSession)
+
+    let execRes: string | undefined
+    const onData = (data: string | Uint8Array) => {
+      if (execRes === undefined) {
+        execRes = ''
+      }
+      execRes += data.toString()
+    }
+
+    programSession.onDidWrite(onData)
+    programSession.onDidErr(onData)
+
+    const success = new Promise<boolean>((resolve, reject) => {
+      programSession.onDidClose(async (code) => {
+        if (code !== 0) {
+          return resolve(false)
+        }
+        return resolve(true)
+      })
+
+      programSession.onInternalErr((e) => {
+        reject(e)
+      })
+
+      const exitReason = programSession.hasExited()
+
+      if (exitReason) {
+        switch (exitReason.type) {
+          case 'error':
+            {
+              reject(exitReason.error)
+            }
+            break
+
+          case 'exit':
+            {
+              resolve(exitReason.code === 0)
+            }
+            break
+
+          default: {
+            resolve(false)
+          }
+        }
+      }
+    })
+
+    programSession.run()
+    const result = await success
+
+    return result ? execRes?.trim() : undefined
   }
 }

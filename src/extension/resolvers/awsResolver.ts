@@ -1,10 +1,11 @@
-import { TextDocument, Disposable } from 'vscode'
+import { Disposable } from 'vscode'
 
 import { StringIndexable } from '../../types'
 
 export enum AWSSupportedView {
   EC2Instances = 'ec2Instances',
   EC2InstanceDetails = 'ec2InstanceDetails',
+  EKSClusters = 'eksClusters',
 }
 
 export interface EC2InstancePath extends StringIndexable {
@@ -18,9 +19,16 @@ export interface EC2InstanceDetailsPath extends StringIndexable {
   urlRegex?: RegExp
 }
 
+export interface EKSClustersPath extends StringIndexable {
+  region: string | null
+  urlRegex?: RegExp
+  cluster?: string | undefined
+}
+
 export interface AWSData {
   [AWSSupportedView.EC2Instances]: EC2InstancePath
   [AWSSupportedView.EC2InstanceDetails]: EC2InstanceDetailsPath
+  [AWSSupportedView.EKSClusters]: EKSClustersPath
 }
 
 export type AWSFeature<T extends AWSSupportedView> = T extends any
@@ -33,7 +41,7 @@ export type AWSFeature<T extends AWSSupportedView> = T extends any
 export class AWSResolver implements Disposable {
   private supportedFeatures: Map<string, AWSFeature<AWSSupportedView>> = new Map()
   private resolvedFeature?: AWSFeature<AWSSupportedView> | undefined
-  constructor(private cell: TextDocument) {
+  constructor(private cellText: string) {
     this.supportedFeatures.set('/ec2/details', {
       view: AWSSupportedView.EC2InstanceDetails,
       data: {
@@ -50,7 +58,14 @@ export class AWSResolver implements Disposable {
       },
     })
 
-    const text = this.cell.getText()
+    this.supportedFeatures.set('/eks/home', {
+      view: AWSSupportedView.EKSClusters,
+      data: {
+        region: '',
+      },
+    })
+
+    const text = this.cellText
     if (text.includes('console.aws.amazon.com')) {
       const url = new URL(text)
       let supportedFeature: AWSFeature<AWSSupportedView> | null = null
@@ -80,6 +95,15 @@ export class AWSResolver implements Disposable {
             })
           }
         }
+
+        if (supportedFeature.view === AWSSupportedView.EKSClusters) {
+          const matches = /clusters\/([^&]+)/.exec(url.toString())
+          if (matches) {
+            const [, clusterName] = matches
+            supportedFeature.data.cluster = clusterName
+          }
+        }
+
         supportedFeature.data.region = url.searchParams.get('region')
         this.resolvedFeature = {
           ...supportedFeature,

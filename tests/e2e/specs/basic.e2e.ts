@@ -51,17 +51,17 @@ describe('Runme VS Code Extension', async () => {
     await webview.close()
   })
 
-  it('should provide a button to run cmd via CLI', async () => {
+  it('should provide a button to fork notebook into terminal', async () => {
     const rows = await $$('.cell-statusbar-container .cell-status-item')
     let row: WebdriverIO.Element | undefined
     for (const r of rows) {
-      if ((await r.getText()).includes('CLI')) {
+      if ((await r.getText()).includes('Fork')) {
         row = r
       }
     }
 
     if (!row) {
-      throw new Error('Could not find CLI button')
+      throw new Error('Could not find Fork button')
     }
   })
 
@@ -122,6 +122,17 @@ describe('Runme VS Code Extension', async () => {
       await cell.run()
       expect(await cell.getCellOutput(OutputType.ShellOutput)).toStrictEqual([
         'Foo 👀\nBar 🕺\nLoo 🚀',
+      ])
+    })
+
+    it('shebang typescript example', async () => {
+      const cell = await notebook.getCell(
+        // eslint-disable-next-line max-len
+        "function unnest({ message }: { message: string }): void {\n    console.log(message)\n}\nunnest({ message: 'Running typescript that outputs this message' })",
+      )
+      await cell.run()
+      expect(await cell.getCellOutput(OutputType.TerminalView)).toStrictEqual([
+        'Running typescript that outputs this message',
       ])
     })
 

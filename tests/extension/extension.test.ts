@@ -5,7 +5,7 @@ import { HealthCheckResponse_ServingStatus } from '@buf/grpc_grpc.community_timo
 
 import { RunmeExtension } from '../../src/extension/extension'
 import { bootFile } from '../../src/extension/utils'
-import RunmeServer from '../../src/extension/server/runmeServer'
+import KernelServer from '../../src/extension/server/kernelServer'
 import { testCertPEM, testPrivKeyPEM } from '../testTLSCert'
 
 vi.mock('vscode')
@@ -46,6 +46,7 @@ vi.mock('../../src/extension/grpc/client', () => {
         return { responses: { onMessage: vi.fn() } }
       }),
     })),
+    initReporterClient: vi.fn(() => ({})),
     HealthClient: class {
       async check() {
         return {
@@ -67,6 +68,17 @@ vi.mock('../../src/extension/utils', async () => ({
   checkSession: vi.fn(),
   togglePreviewButton: vi.fn(),
   resetNotebookSettings: vi.fn(),
+  getGithubAuthSession: vi.fn().mockResolvedValue(undefined),
+  getPlatformAuthSession: vi.fn().mockResolvedValue(undefined),
+  getEnvProps: vi.fn().mockReturnValue({
+    extname: 'stateful.runme',
+    extversion: '1.2.3-foo.1',
+    remotename: 'none',
+    appname: 'Visual Studio Code',
+    product: 'desktop',
+    platform: 'darwin_arm64',
+    uikind: 'desktop',
+  }),
 }))
 
 vi.mock('../../src/extension/grpc/runner/v1', () => ({}))
@@ -74,18 +86,27 @@ vi.mock('../../src/extension/grpc/runner/v1', () => ({}))
 test('initializes all providers', async () => {
   const configValues = {
     binaryPath: 'bin',
+    // This is needed for the AIManager to initialize.
+    aiBaseURL: 'http://localhost:8877/api',
   }
   vi.mocked(workspace.getConfiguration).mockReturnValue({
     get: vi.fn((config: string) => configValues[config]),
+    has: vi.fn(),
   } as any)
   const dummyFilePath = Uri.file('/foo/bar')
   vi.mocked(Uri.joinPath).mockReturnValue(dummyFilePath)
-  RunmeServer['getTLS'] = vi
+  KernelServer['getTLS'] = vi
     .fn()
     .mockResolvedValue({ privKeyPEM: testPrivKeyPEM, certPEM: testCertPEM })
   const context: any = {
     subscriptions: [],
     extensionUri: { fsPath: '/foo/bar' },
+    extension: {
+      id: 'foo.bar',
+      packageJSON: {
+        version: '1.2.3-rc.4',
+      },
+    },
     environmentVariableCollection: {
       prepend: vi.fn(),
       append: vi.fn(),
@@ -99,7 +120,7 @@ test('initializes all providers', async () => {
   await ext.initialize(context)
   expect(notebooks.registerNotebookCellStatusBarItemProvider).toBeCalledTimes(5)
   expect(workspace.registerNotebookSerializer).toBeCalledTimes(1)
-  expect(commands.registerCommand).toBeCalledTimes(39)
+  expect(commands.registerCommand).toBeCalledTimes(48)
   expect(window.registerTreeDataProvider).toBeCalledTimes(1)
   expect(window.registerUriHandler).toBeCalledTimes(1)
   expect(bootFile).toBeCalledTimes(1)

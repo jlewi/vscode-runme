@@ -21,7 +21,7 @@
       "preLaunchTask": "npm: watch"
     },
     {
-      "name": "Run Extension (no server)",
+      "name": "Run Extension (no webpack)",
       "type": "extensionHost",
       "request": "launch",
       "args": [
@@ -64,7 +64,7 @@
       "smartStep": true,
       "console": "integratedTerminal",
       "env": {
-        "NODE_OPTIONS": "--experimental-specifier-resolution=node"
+        "NODE_OPTIONS": "--import=./specifier-register.mjs"
       },
     },
     {
@@ -86,7 +86,7 @@
         "<node_internals>/**/*.js"
       ],
       "env": {
-        "NODE_OPTIONS": "--experimental-specifier-resolution=node"
+        "NODE_OPTIONS": "--import=./specifier-register.mjs"
       },
     }
   ]

@@ -11,8 +11,9 @@ import { GrpcSerializer } from '../../serializer'
 import { AnnotationsStatusBarItem } from './items/annotations'
 import { CopyStatusBarItem } from './items/copy'
 import CellStatusBarItem from './items/cellStatusBarItem'
-import { CLIStatusBarItem } from './items/cli'
+import { ForkStatusBarItem } from './items/fork'
 import { NamedStatusBarItem } from './items/named'
+import { CLIStatusBarItem } from './items/cli'
 
 /**
  * Cell Status Bar items provider for Runme Notebooks Only.
@@ -24,8 +25,10 @@ export class NotebookCellStatusBarProvider implements NotebookCellStatusBarItemP
     this.#cellStatusBarItems = new Set()
     this.#cellStatusBarItems.add(new AnnotationsStatusBarItem(this.kernel))
     this.#cellStatusBarItems.add(new CopyStatusBarItem(this.kernel))
-    this.#cellStatusBarItems.add(new CLIStatusBarItem(this.kernel))
     this.#cellStatusBarItems.add(new NamedStatusBarItem(this.kernel))
+    this.#cellStatusBarItems.add(new CLIStatusBarItem(this.kernel))
+    this.#cellStatusBarItems.add(new ForkStatusBarItem(this.kernel))
+
     this.#registerCommands()
   }
 

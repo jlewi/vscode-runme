@@ -22,20 +22,19 @@ import {
 import { GrpcTransport } from '@protobuf-ts/grpc-transport'
 import { ulid } from 'ulidx'
 import { maskString } from 'data-guardian'
+import YAML from 'yaml'
 
 import { Serializer } from '../types'
 import {
   NOTEBOOK_AUTOSAVE_ON,
   NOTEBOOK_HAS_OUTPUTS,
+  NOTEBOOK_LIFECYCLE_ID,
   NOTEBOOK_OUTPUTS_MASKED,
   OutputType,
+  RUNME_FRONTMATTER_PARSED,
   VSCODE_LANGUAGEID_MAP,
 } from '../constants'
-import {
-  ServerLifecycleIdentity,
-  getServerConfigurationValue,
-  getSessionOutputs,
-} from '../utils/configuration'
+import { ServerLifecycleIdentity, getSessionOutputs } from '../utils/configuration'
 
 import {
   DeserializeRequest,
@@ -46,19 +45,23 @@ import {
   CellOutput,
   SerializeRequestOptions,
   RunmeSession,
+  Frontmatter,
 } from './grpc/serializerTypes'
 import { initParserClient, ParserServiceClient, type ReadyPromise } from './grpc/client'
 import Languages from './languages'
 import { PLATFORM_OS } from './constants'
 import { initWasm } from './utils'
-import { IServer } from './server/runmeServer'
+import { IServer } from './server/kernelServer'
 import { Kernel } from './kernel'
 import { getCellById } from './cell'
 import { IProcessInfoState } from './terminal/terminalState'
 import ContextState from './contextState'
+import * as ghost from './ai/ghost'
+import getLogger from './logger'
 
 declare var globalThis: any
 const DEFAULT_LANG_ID = 'text'
+const log = getLogger('serializer')
 
 type NotebookCellOutputWithProcessInfo = NotebookCellOutput & {
   processInfo?: IProcessInfoState
@@ -68,8 +71,6 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
   protected abstract readonly ready: ReadyPromise
   protected readonly languages: Languages
   protected disposables: Disposable[] = []
-  protected readonly lifecycleIdentity: ServerLifecycleIdentity =
-    getServerConfigurationValue<ServerLifecycleIdentity>('lifecycleIdentity', RunmeIdentity.ALL)
 
   constructor(
     protected context: ExtensionContext,
@@ -86,6 +87,10 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
 
   public dispose() {
     this.disposables.forEach((d) => d.dispose())
+  }
+
+  protected get lifecycleIdentity() {
+    return ContextState.getKey<ServerLifecycleIdentity>(NOTEBOOK_LIFECYCLE_ID)
   }
 
   /**
@@ -105,7 +110,7 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
 
         const notebookEdit = NotebookEdit.updateCellMetadata(
           cellAdded.index,
-          SerializerBase.addCellId(cellAdded.metadata),
+          SerializerBase.addCellId(cellAdded.metadata, this.lifecycleIdentity),
         )
         const edit = new WorkspaceEdit()
         edit.set(cellAdded.notebook.uri, [notebookEdit])
@@ -114,6 +119,7 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
     })
   }
 
+  // TODO: Deadcode
   protected async handleNotebookSaved({ uri, cellAt }: NotebookDocument) {
     // update changes in metadata
     const bytes = await workspace.fs.readFile(uri)
@@ -142,14 +148,31 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
     await workspace.applyEdit(edit)
   }
 
-  public static addCellId(metadata: Serializer.Metadata | undefined): {
+  public static addCellId(
+    metadata: Serializer.Metadata | undefined,
+    identity: RunmeIdentity,
+  ): {
     [key: string]: any
   } {
-    const id = metadata?.id || metadata?.['runme.dev/id']
-    const newId = id || ulid()
+    // never run for cells that came out of kernel
+    if (metadata?.['runme.dev/id']) {
+      return metadata
+    }
+
+    // newly inserted cells may have blank metadata
+    const id = metadata?.['id'] || ulid()
+
+    // only set `id` if all or cell identity is required
+    if (identity === RunmeIdentity.ALL || identity === RunmeIdentity.CELL) {
+      return {
+        ...(metadata || {}),
+        ...{ 'runme.dev/id': id, id },
+      }
+    }
+
     return {
       ...(metadata || {}),
-      ...{ id: newId, 'runme.dev/id': newId },
+      ...{ 'runme.dev/id': id },
     }
   }
 
@@ -167,10 +190,18 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
     const cells = await SerializerBase.addExecInfo(data, this.kernel)
 
     const metadata = data.metadata
-    data = new NotebookData(cells)
-    data.metadata = metadata
 
-    this.reconcileCellIdentity(data)
+    // Prune any ghost cells when saving.
+    const cellsToSave = []
+    for (let i = 0; i < cells.length; i++) {
+      if (SerializerBase.isGhostCell(cells[i])) {
+        continue
+      }
+      cellsToSave.push(cells[i])
+    }
+
+    data = new NotebookData(cellsToSave)
+    data.metadata = metadata
 
     let encoded: Uint8Array
     try {
@@ -186,18 +217,14 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
   public static async addExecInfo(data: NotebookData, kernel: Kernel): Promise<NotebookCellData[]> {
     return Promise.all(
       data.cells.map(async (cell) => {
-        let terminalOutput: NotebookCellOutputWithProcessInfo | undefined
         let id: string = ''
-        for (const out of cell.outputs || []) {
-          Object.entries(out.metadata ?? {}).find(([k, v]) => {
-            if (k === 'runme.dev/id') {
-              terminalOutput = out
-              id = v
-            }
-          })
+        let terminalOutput: NotebookCellOutputWithProcessInfo | undefined
 
-          if (terminalOutput) {
-            delete out.metadata?.['runme.dev/id']
+        for (const cellOutput of cell.outputs || []) {
+          const terminalMime = cellOutput.items.find((item) => item.mime === OutputType.terminal)
+          id = cell.metadata?.['runme.dev/id'] || cell.metadata?.['id'] || ''
+          if (terminalMime && id) {
+            terminalOutput = cellOutput
             break
           }
         }
@@ -270,7 +297,11 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
       const cells = notebook.cells ?? []
       notebook.cells = await Promise.all(
         cells.map((elem) => {
-          if (elem.kind === NotebookCellKind.Code && elem.value && (elem.languageId || '') === '') {
+          if (elem.kind !== NotebookCellKind.Code) {
+            return Promise.resolve(elem)
+          }
+
+          if (elem.value && (elem.languageId || '') === '') {
             const norm = SerializerBase.normalize(elem.value)
             return this.languages.guess(norm, PLATFORM_OS).then((guessed) => {
               if (guessed) {
@@ -279,6 +310,11 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
               return elem
             })
           }
+
+          if (elem.languageId && VSCODE_LANGUAGEID_MAP[elem.languageId]) {
+            elem.languageId = VSCODE_LANGUAGEID_MAP[elem.languageId]
+          }
+
           return Promise.resolve(elem)
         }),
       )
@@ -287,9 +323,9 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
     }
 
     notebook.metadata ??= {}
-    notebook.metadata['runme.dev/frontmatterParsed'] = notebook.frontmatter
+    notebook.metadata[RUNME_FRONTMATTER_PARSED] = notebook.frontmatter
 
-    const notebookData = new NotebookData(SerializerBase.revive(notebook))
+    const notebookData = new NotebookData(SerializerBase.revive(notebook, this.lifecycleIdentity))
     if (notebook.metadata) {
       notebookData.metadata = notebook.metadata
     } else {
@@ -299,7 +335,9 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
     return notebookData
   }
 
-  protected static revive(notebook: Serializer.Notebook) {
+  // revive converts the Notebook proto to VSCode's NotebookData.
+  // It returns a an array of VSCode NotebookCellData objects.
+  public static revive(notebook: Serializer.Notebook, identity: RunmeIdentity) {
     return notebook.cells.reduce(
       (accu, elem) => {
         let cell: NotebookCellData
@@ -318,7 +356,7 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
           // The serializer used to own the lifecycle of IDs, however,
           // that's no longer true since they are coming out of the kernel now.
           // However, if "net new" cells show up after deserialization, ie inserts, we backfill them here.
-          cell.metadata = SerializerBase.addCellId(elem.metadata)
+          cell.metadata = SerializerBase.addCellId(elem.metadata, identity)
         }
 
         cell.metadata ??= {}
@@ -332,6 +370,15 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
     )
   }
 
+  public async switchLifecycleIdentity(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    notebook: NotebookDocument,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    identity: RunmeIdentity,
+  ): Promise<boolean> {
+    return false
+  }
+
   public static normalize(source: string): string {
     const lines = source.split('\n')
     const normed = lines.filter((l) => !(l.trim().startsWith('```') || l.trim().endsWith('```')))
@@ -342,29 +389,20 @@ export abstract class SerializerBase implements NotebookSerializer, Disposable {
     return new NotebookData([new NotebookCellData(NotebookCellKind.Markup, content, languageId)])
   }
 
-  /**
-   * Reconciles cell identity based on lifecycle identity, ie removes it if cell identity is not required.
-   */
-  protected reconcileCellIdentity(data: NotebookData): NotebookData {
-    const identity = this.lifecycleIdentity
-
-    if (identity === RunmeIdentity.ALL || identity === RunmeIdentity.CELL) {
-      return data
-    }
-
-    data.cells.forEach((cell) => {
-      if (cell.metadata?.['id'] !== undefined) {
-        cell.metadata['runme.dev/id'] = cell.metadata['id']
-        delete cell.metadata['id']
-      }
-    })
-
-    return data
-  }
-
   protected abstract saveNotebookOutputsByCacheId(cacheId: string): Promise<number>
 
   public abstract saveNotebookOutputs(uri: Uri): Promise<number>
+
+  public abstract getMaskedCache(cacheId: string): Promise<Uint8Array> | undefined
+
+  public abstract getPlainCache(cacheId: string): Promise<Uint8Array> | undefined
+
+  public abstract getNotebookDataCache(cacheId: string): NotebookData | undefined
+
+  static isGhostCell(cell: NotebookCellData): boolean {
+    const metadata = cell.metadata
+    return metadata?.[ghost.ghostKey] === true
+  }
 }
 
 export class WasmSerializer extends SerializerBase {
@@ -418,6 +456,21 @@ export class WasmSerializer extends SerializerBase {
     console.error('saveNotebookOutputs not implemented for WasmSerializer')
     return -1
   }
+
+  public getMaskedCache(): Promise<Uint8Array> | undefined {
+    console.error('getMaskedCache not implemented for WasmSerializer')
+    return Promise.resolve(new Uint8Array())
+  }
+
+  public getPlainCache(): Promise<Uint8Array> | undefined {
+    console.error('getPlainCache not implemented for WasmSerializer')
+    return Promise.resolve(new Uint8Array())
+  }
+
+  public getNotebookDataCache(): NotebookData | undefined {
+    console.error('getNotebookDataCache not implemented for WasmSerializer')
+    return {} as NotebookData
+  }
 }
 
 export class GrpcSerializer extends SerializerBase {
@@ -426,6 +479,7 @@ export class GrpcSerializer extends SerializerBase {
   // todo(sebastian): naive cache for now, consider use lifecycle events for gc
   protected readonly plainCache = new Map<string, Promise<Uint8Array>>()
   protected readonly maskedCache = new Map<string, Promise<Uint8Array>>()
+  protected readonly notebookDataCache = new Map<string, NotebookData>()
   protected readonly cacheDocUriMapping: Map<string, Uri> = new Map<string, Uri>()
 
   private serverReadyListener: Disposable | undefined
@@ -507,12 +561,6 @@ export class GrpcSerializer extends SerializerBase {
   }
 
   protected async saveNotebookOutputsByCacheId(cacheId: string): Promise<number> {
-    // if session outputs are disabled, we don't write anything
-    if (!GrpcSerializer.sessionOutputsEnabled()) {
-      this.togglePreviewButton(false)
-      return -1
-    }
-
     const mode = ContextState.getKey<boolean>(NOTEBOOK_OUTPUTS_MASKED)
     const cache = mode ? this.maskedCache : this.plainCache
     const bytes = await cache.get(cacheId ?? '')
@@ -533,6 +581,13 @@ export class GrpcSerializer extends SerializerBase {
     if (!sessionId) {
       this.togglePreviewButton(false)
       return -1
+    }
+
+    // Don't write to disk if auto-save is off
+    if (!ContextState.getKey<boolean>(NOTEBOOK_AUTOSAVE_ON)) {
+      this.togglePreviewButton(false)
+      // But still return a valid bytes length so the cache keeps working
+      return bytes.length
     }
 
     const sessionFile = GrpcSerializer.getOutputsUri(srcDocUri, sessionId)
@@ -578,9 +633,11 @@ export class GrpcSerializer extends SerializerBase {
   public static getSourceFilePath(outputsFile: string): string {
     const fileExt = path.extname(outputsFile)
     let fileBase = path.basename(outputsFile, fileExt)
-    if (fileBase.includes('-')) {
-      fileBase = fileBase.split('-')[0]
+    const parts = fileBase.split('-')
+    if (parts.length > 1) {
+      parts.pop()
     }
+    fileBase = parts.join('-')
     const fileDir = path.dirname(outputsFile)
     const filePath = path.normalize(`${fileDir}/${fileBase}${fileExt}`)
 
@@ -619,10 +676,10 @@ export class GrpcSerializer extends SerializerBase {
       return undefined
     }
 
-    const ephemeralId = metadata['runme.dev/id'] as string | undefined
-    const lid = metadata['runme.dev/frontmatterParsed']?.['runme']?.['id'] as string | undefined
+    // cacheId is always present, stays persistent across multiple de/-serialization cycles
+    const cacheId = metadata['runme.dev/cacheId'] as string | undefined
 
-    return lid ?? ephemeralId
+    return cacheId
   }
 
   public static isDocumentSessionOutputs(metadata: { [key: string]: any } | undefined): boolean {
@@ -630,8 +687,50 @@ export class GrpcSerializer extends SerializerBase {
       // it's not session outputs unless known
       return false
     }
-    const sessionOutputId = metadata['runme.dev/frontmatterParsed']?.['runme']?.['session']?.['id']
+    const sessionOutputId = metadata[RUNME_FRONTMATTER_PARSED]?.['runme']?.['session']?.['id']
     return Boolean(sessionOutputId)
+  }
+
+  public override async switchLifecycleIdentity(
+    notebook: NotebookDocument,
+    identity: RunmeIdentity,
+  ): Promise<boolean> {
+    // skip session outputs files
+    if (!!notebook.metadata['runme.dev/frontmatterParsed']?.runme?.session?.id) {
+      return false
+    }
+
+    await notebook.save()
+    const source = await workspace.fs.readFile(notebook.uri)
+    const des = await this.client!.deserialize(
+      DeserializeRequest.create({
+        source,
+        options: { identity },
+      }),
+    )
+
+    const deserialized = des.response.notebook
+    if (!deserialized) {
+      return false
+    }
+
+    deserialized.metadata = { ...deserialized.metadata, ...notebook.metadata }
+    const notebookEdit = NotebookEdit.updateNotebookMetadata(deserialized.metadata)
+    const edits = [notebookEdit]
+    notebook.getCells().forEach((cell) => {
+      const descell = deserialized.cells[cell.index]
+      // skip if no IDs are present, means no cell identity required
+      if (!descell.metadata?.['id']) {
+        return
+      }
+      const metadata = { ...descell.metadata, ...cell.metadata }
+      metadata['id'] = metadata['runme.dev/id']
+      edits.push(NotebookEdit.updateCellMetadata(cell.index, metadata))
+    })
+
+    const edit = new WorkspaceEdit()
+    edit.set(notebook.uri, edits)
+    return await workspace.applyEdit(edit)
   }
 
   protected async saveNotebook(
@@ -639,9 +738,18 @@ export class GrpcSerializer extends SerializerBase {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     token: CancellationToken,
   ): Promise<Uint8Array> {
-    const notebook = GrpcSerializer.marshalNotebook(data)
+    const marshalFrontmatter = this.lifecycleIdentity === RunmeIdentity.ALL
+
+    const notebook = GrpcSerializer.marshalNotebook(data, { marshalFrontmatter })
+
+    if (marshalFrontmatter) {
+      data.metadata ??= {}
+      data.metadata[RUNME_FRONTMATTER_PARSED] = notebook.frontmatter
+    }
 
     const cacheId = GrpcSerializer.getDocumentCacheId(data.metadata)
+    this.notebookDataCache.set(cacheId as string, data)
+
     const serialRequest = <SerializeRequest>{ notebook }
 
     const cacheOutputs = this.cacheNotebookOutputs(notebook, cacheId)
@@ -663,17 +771,16 @@ export class GrpcSerializer extends SerializerBase {
   }
 
   static sessionOutputsEnabled() {
-    return getSessionOutputs() && ContextState.getKey<boolean>(NOTEBOOK_AUTOSAVE_ON)
+    const isAutoSaveOn = ContextState.getKey<boolean>(NOTEBOOK_AUTOSAVE_ON)
+    const isSessionOutputs = getSessionOutputs()
+
+    return isSessionOutputs && isAutoSaveOn
   }
 
   private async cacheNotebookOutputs(
     notebook: Notebook,
     cacheId: string | undefined,
   ): Promise<void> {
-    if (!GrpcSerializer.sessionOutputsEnabled()) {
-      return Promise.resolve(undefined)
-    }
-
     let session: RunmeSession | undefined
     const docUri = this.cacheDocUriMapping.get(cacheId ?? '')
     const sid = this.kernel.getRunnerEnvironment()?.getSessionId()
@@ -737,13 +844,27 @@ export class GrpcSerializer extends SerializerBase {
     await Promise.all([plain, masked])
   }
 
-  public static marshalNotebook(data: NotebookData): Notebook {
+  // marshalNotebook converts VSCode's NotebookData to the Notebook proto.
+  public static marshalNotebook(
+    data: NotebookData,
+    config?: {
+      marshalFrontmatter?: boolean
+      kernel?: Kernel
+    },
+  ): Notebook {
     // the bulk copies cleanly except for what's below
     const notebook = Notebook.clone(data as any)
 
     // cannot gurantee it wasn't changed
-    if (notebook.metadata['runme.dev/frontmatterParsed']) {
-      delete notebook.metadata['runme.dev/frontmatterParsed']
+    if (notebook.metadata[RUNME_FRONTMATTER_PARSED]) {
+      delete notebook.metadata[RUNME_FRONTMATTER_PARSED]
+    }
+
+    if (config?.marshalFrontmatter) {
+      const metadata = notebook.metadata as unknown as {
+        ['runme.dev/frontmatter']: string
+      }
+      notebook.frontmatter = this.marshalFrontmatter(metadata, config.kernel)
     }
 
     notebook.cells.forEach(async (cell, cellIdx) => {
@@ -754,6 +875,42 @@ export class GrpcSerializer extends SerializerBase {
     })
 
     return notebook
+  }
+
+  static marshalFrontmatter(
+    metadata: { ['runme.dev/frontmatter']: string },
+    kernel?: Kernel,
+  ): Frontmatter {
+    const rawFrontmatter = metadata['runme.dev/frontmatter']
+    let data: {
+      runme: {
+        id?: string
+        version?: string
+      }
+    } = { runme: {} }
+
+    if (rawFrontmatter) {
+      try {
+        const yamlDocs = YAML.parseAllDocuments(metadata['runme.dev/frontmatter'])
+        data = (yamlDocs[0].toJS?.() || {}) as typeof data
+      } catch (error: any) {
+        log.warn('failed to parse frontmatter, reason: ', error.message)
+      }
+    }
+
+    return {
+      runme: {
+        id: data.runme?.id || '',
+        version: data.runme?.version || '',
+        session: { id: kernel?.getRunnerEnvironment()?.getSessionId() || '' },
+      },
+      category: '',
+      // tag: '',
+      cwd: '',
+      shell: '',
+      skipPrompts: false,
+      terminalRows: '',
+    }
   }
 
   private static marshalCellOutputs(
@@ -832,5 +989,17 @@ export class GrpcSerializer extends SerializerBase {
   public dispose(): void {
     this.serverReadyListener?.dispose()
     super.dispose()
+  }
+
+  public getMaskedCache(cacheId: string): Promise<Uint8Array> | undefined {
+    return this.maskedCache.get(cacheId)
+  }
+
+  public getPlainCache(cacheId: string): Promise<Uint8Array> | undefined {
+    return this.plainCache.get(cacheId)
+  }
+
+  public getNotebookDataCache(cacheId: string): NotebookData | undefined {
+    return this.notebookDataCache.get(cacheId)
   }
 }

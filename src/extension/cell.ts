@@ -16,7 +16,7 @@ import {
 } from 'vscode'
 
 import {
-  CLOUD_USER_SIGNED_IN,
+  GITHUB_USER_SIGNED_IN,
   NOTEBOOK_AUTOSAVE_ON,
   OutputType,
   PLATFORM_USER_SIGNED_IN,
@@ -25,6 +25,7 @@ import {
   AWSState,
   CellOutputPayload,
   DenoState,
+  FeatureName,
   GCPState,
   GitHubState,
   Serializer,
@@ -32,11 +33,13 @@ import {
 } from '../types'
 import { Mutex } from '../utils/sync'
 import {
+  getDocsUrl,
   getNotebookTerminalConfigurations,
+  getSessionOutputs,
   isPlatformAuthEnabled,
-  isRunmeAppButtonsEnabled,
 } from '../utils/configuration'
 
+import features from './features'
 import { RUNME_TRANSIENT_REVISION } from './constants'
 import { getAnnotations, replaceOutput, validateAnnotations } from './utils'
 import {
@@ -47,7 +50,6 @@ import {
 } from './terminal/terminalState'
 import ContextState from './contextState'
 import { IRunnerEnvironment } from './runner/environment'
-import { GrpcSerializer } from './serializer'
 
 const NOTEBOOK_SELECTION_COMMAND = '_notebook.selectKernel'
 
@@ -121,6 +123,7 @@ interface InsertCodeCellOptions {
   displayConfirmationDialog: boolean
   languageId: string
   background: boolean
+  run: boolean
 }
 
 export class NotebookCellOutputManager {
@@ -133,6 +136,7 @@ export class NotebookCellOutputManager {
     [OutputType.github, false],
     [OutputType.gcp, false],
     [OutputType.aws, false],
+    [OutputType.dagger, false],
   ])
 
   protected sessionExecutionOrder = new Map<string, number | undefined>()
@@ -148,6 +152,7 @@ export class NotebookCellOutputManager {
 
   protected terminalState?: ITerminalState
   protected terminalEnabled = false
+  protected outputsState?: Map<OutputType, Map<string, any>>
 
   constructor(
     protected cell: NotebookCell,
@@ -166,14 +171,35 @@ export class NotebookCellOutputManager {
             annotations: getAnnotations(cell),
             validationErrors: validateAnnotations(cell),
             id: cell.metadata['runme.dev/id'],
+            settings: {
+              docsUrl: getDocsUrl(),
+            },
           },
         }
 
         return new NotebookCellOutput([
           NotebookCellOutputItem.json(annotationJson, OutputType.annotations),
-          // disable to prevent rendering in session outputs
-          // NotebookCellOutputItem.json(annotationJson),
+          NotebookCellOutputItem.json(annotationJson),
         ])
+      }
+
+      case OutputType.dagger: {
+        const cellId = cell.metadata['runme.dev/id']
+        const payload: CellOutputPayload<OutputType.dagger> = {
+          type: OutputType.dagger,
+          output: { cellId },
+        }
+
+        const output = this.outputsState?.get?.(type)?.get?.(cellId)
+
+        payload.output = {
+          ...payload.output,
+          output: { json: output?.json, text: output?.text },
+        }
+
+        return new NotebookCellOutput([NotebookCellOutputItem.json(payload, OutputType.dagger)], {
+          daggerCellId: cellId,
+        })
       }
 
       case OutputType.deno: {
@@ -214,13 +240,19 @@ export class NotebookCellOutputManager {
         if (type === OutputType.terminal) {
           let terminalOutputItem: NotebookCellOutputItem | undefined
 
+          const daggerOutput = cell.outputs.find(
+            ({ metadata }) => metadata?.daggerCellId === cellId,
+          )
+
           const terminalStateStr = terminalState.serialize()
           if (!terminalOutputItem) {
-            const terminalConfigurations = getNotebookTerminalConfigurations()
+            const terminalConfigurations = getNotebookTerminalConfigurations(cell.notebook.metadata)
 
             const isSignedIn = isPlatformAuthEnabled()
               ? ContextState.getKey(PLATFORM_USER_SIGNED_IN)
-              : ContextState.getKey(CLOUD_USER_SIGNED_IN)
+              : ContextState.getKey(GITHUB_USER_SIGNED_IN)
+
+            const isSessionOutputsEnabled = getSessionOutputs()
 
             const json: CellOutputPayload<OutputType.terminal> = {
               type: OutputType.terminal,
@@ -228,8 +260,10 @@ export class NotebookCellOutputManager {
                 'runme.dev/id': cellId,
                 content: stdoutBase64,
                 initialRows: terminalRows || terminalConfigurations.rows,
-                enableShareButton: isRunmeAppButtonsEnabled(),
                 isAutoSaveEnabled: isSignedIn ? ContextState.getKey(NOTEBOOK_AUTOSAVE_ON) : false,
+                isPlatformAuthEnabled: isPlatformAuthEnabled(),
+                isSessionOutputsEnabled,
+                isDaggerOutput: !!daggerOutput,
                 ...terminalConfigurations,
               },
             }
@@ -299,6 +333,34 @@ export class NotebookCellOutputManager {
         return undefined
       }
     }
+  }
+
+  saveOutputState(cellId: string, type: OutputType, value: any) {
+    if (!this.outputsState) {
+      this.outputsState = new Map()
+    }
+
+    let outputState = this.outputsState.get(type)
+
+    if (!outputState) {
+      outputState = new Map()
+    }
+
+    outputState.set(cellId, value)
+    this.outputsState.set(type, outputState)
+  }
+
+  cleanOutputState(cellId: string, type: OutputType) {
+    if (!this.outputsState) {
+      return
+    }
+
+    const outputState = this.outputsState.get(type)
+    if (!outputState) {
+      return
+    }
+
+    outputState.delete(cellId)
   }
 
   registerCellTerminalState(type: NotebookTerminalType): ITerminalState {
@@ -469,9 +531,17 @@ export class NotebookCellOutputManager {
    *
    */
   async refreshTerminal(terminalState: ITerminalState | undefined): Promise<void> {
-    if (!ContextState.getKey(NOTEBOOK_AUTOSAVE_ON)) {
+    const isSignedIn = features.isOnInContextState(FeatureName.SignedIn)
+    const isForceLogin = features.isOnInContextState(FeatureName.ForceLogin)
+
+    const isAutoSaveOn = ContextState.getKey(NOTEBOOK_AUTOSAVE_ON)
+
+    if (!isSignedIn && !isAutoSaveOn) {
+      return Promise.resolve()
+    } else if (!isSignedIn && isForceLogin) {
       return Promise.resolve()
     }
+
     await this.withLock(async () => {
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       await this.getExecutionUnsafe(async (exec) => {
@@ -495,7 +565,7 @@ export class NotebookCellOutputManager {
           }
         }
 
-        if (!GrpcSerializer.sessionOutputsEnabled() || !terminalOutput || !terminalOutputItem) {
+        if (!getSessionOutputs() || !terminalOutput || !terminalOutputItem) {
           return
         }
 
@@ -729,6 +799,7 @@ export async function insertCodeCell(
   input: string,
   languageId: string = 'sh',
   background: boolean = false,
+  run: boolean = true,
 ) {
   const cell = await getCellById({ editor, id: cellId })
   if (!cell) {
@@ -740,6 +811,7 @@ export async function insertCodeCell(
     displayConfirmationDialog: false,
     languageId,
     background,
+    run,
   })
 }
 
@@ -749,6 +821,7 @@ export async function insertCodeNotebookCell({
   displayConfirmationDialog,
   languageId,
   background,
+  run,
 }: InsertCodeCellOptions) {
   if (displayConfirmationDialog) {
     const answer = await window.showInformationMessage(
@@ -771,6 +844,9 @@ export async function insertCodeNotebookCell({
   edit.set(cell.notebook.uri, [notebookEdit])
   workspace.applyEdit(edit)
   await commands.executeCommand('notebook.focusNextEditor')
+  if (!run) {
+    return
+  }
   await commands.executeCommand('notebook.cell.execute')
   await commands.executeCommand('notebook.cell.focusInOutput')
 }

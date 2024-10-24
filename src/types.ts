@@ -17,8 +17,11 @@ import {
   MonitoringState,
   _InstanceType,
 } from '@aws-sdk/client-ec2'
+import { google } from '@google-cloud/run/build/protos/protos'
+import { protos } from '@google-cloud/compute'
+import { type BehaviorSubject } from 'rxjs'
 
-import { OutputType, ClientMessages } from './constants'
+import { OutputType, ClientMessages, RUNME_FRONTMATTER_PARSED } from './constants'
 import { SafeCellAnnotationsSchema, SafeNotebookAnnotationsSchema } from './schema'
 import type { IRunnerProgramSession } from './extension/runner'
 import type * as Grpc from './extension/grpc/serializerTypes'
@@ -33,6 +36,8 @@ import type { TerminalConfiguration } from './utils/configuration'
 import { GCPSupportedView } from './extension/resolvers/gcpResolver'
 import { AWSSupportedView } from './extension/resolvers/awsResolver'
 import { MonitorEnvStoreResponseSnapshot_SnapshotEnv } from './extension/grpc/runner/v1'
+import { Revision } from './extension/executors/gcp/run/types'
+import { IndexableCluster } from './extension/executors/aws/types'
 
 export interface SyncSchema {
   onCommand?: {
@@ -54,6 +59,9 @@ export interface SyncSchema {
   }
   onCellUnArchived?: {
     cellId: string
+  }
+  onSiteOpen?: {
+    url: string
   }
 }
 
@@ -95,9 +103,10 @@ export namespace Serializer {
     ['runme.dev/nameGenerated']?: string
     ['runme.dev/id']?: string
     ['runme.dev/denoState']?: DenoState
+    ['runme.dev/daggerState']?: DaggerState
     ['runme.dev/vercelState']?: VercelState
     ['runme.dev/githubState']?: GitHubState
-    ['runme.dev/frontmatterParsed']?: Grpc.Frontmatter
+    [RUNME_FRONTMATTER_PARSED]?: Grpc.Frontmatter
     ['runme.dev/textRange']?: Grpc.Cell['textRange']
     ['runme.dev/gcpState']?: GCPState
   }
@@ -136,6 +145,27 @@ export interface GitHubState {
   error?: any
   cellId?: string
   environments?: RepositoryEnvironments
+}
+
+export type DaggerStateAction = {
+  label: string
+  action: string
+  argument?: string
+  command?: string
+}
+
+export interface DaggerState {
+  cellId?: string
+  output?: {
+    json?: string
+    text?: string
+  }
+  cli?: {
+    status: string
+    actions: [DaggerStateAction]
+    returnType?: string
+    returnText?: string
+  }
 }
 
 export interface StringIndexable {
@@ -182,6 +212,13 @@ export enum InstanceStatusType {
 export enum AWSActionType {
   ConnectViaSSH = 'connectViaSsh',
   EC2InstanceDetails = 'aws:ec2InstanceDetails',
+  EKSClusterDetails = 'aws:eksClusterDetails',
+}
+
+export enum GCPCloudRunActionType {
+  DescribeYAML = 'describeYAML',
+  DownloadYAML = 'downloadYAML',
+  ViewRevisions = 'viewRevisions',
 }
 
 export interface GcpGceVMInstance extends StringIndexable {
@@ -200,6 +237,22 @@ export interface GcpGceVMInstance extends StringIndexable {
     }
   }
   pools?: InstancePool[]
+}
+
+export interface GcpCloudRunService extends StringIndexable {
+  creator: string
+  lastModifier: string
+  name: string
+  uri: string
+  updateTime: string | null
+  ingress:
+    | google.cloud.run.v2.IngressTraffic
+    | keyof typeof google.cloud.run.v2.IngressTraffic
+    | null
+  ingressDisplayName: string
+  serviceName: string
+  isHealthy: boolean
+  region: string
 }
 
 export interface GcpGkeClustersState {
@@ -228,9 +281,41 @@ export interface GcpGceVMInstancesState {
   cellId: string
 }
 
-export type GCPState = GcpGkeClustersState | GcpGkeClusterState | GcpGceVMInstancesState
+export interface GcpGceVMInstanceState {
+  project?: string
+  zone?: string
+  instance: protos.google.cloud.compute.v1.IInstance
+  disks: protos.google.cloud.compute.v1.IDisk[]
+  view: GCPSupportedView.VM_INSTANCE
+  cellId: string
+}
 
-export type AWSState = AWSEC2InstanceState | AWSEC2InstanceDetailsState
+export interface GcpCloudRunServicesState {
+  project?: string
+  zone?: string
+  services?: GcpCloudRunService[]
+  view: GCPSupportedView.CLOUD_RUN_SERVICES
+  cellId: string
+}
+
+export interface GcpCloudRunRevisionsState {
+  project?: string
+  region: string
+  revisions?: Revision[]
+  view: GCPSupportedView.CLOUD_RUN_REVISIONS
+  cellId: string
+  service: string
+}
+
+export type GCPState =
+  | GcpGkeClustersState
+  | GcpGkeClusterState
+  | GcpGceVMInstancesState
+  | GcpGceVMInstanceState
+  | GcpCloudRunServicesState
+  | GcpCloudRunRevisionsState
+
+export type AWSState = AWSEC2InstanceState | AWSEC2InstanceDetailsState | AWSEKSClustersState
 
 export interface AWSEC2Instance extends StringIndexable {
   name: string
@@ -247,6 +332,7 @@ export interface AWSEC2Instance extends StringIndexable {
   platform: string | undefined
   securityGroups?: GroupIdentifier[]
   lifecycle: InstanceLifecycleType | undefined
+  imageName: string
 }
 
 export interface AWSEC2InstanceDetails {
@@ -268,27 +354,45 @@ export interface AWSEC2InstanceDetailsState {
   view: AWSSupportedView.EC2InstanceDetails
 }
 
+export interface AWSEKSClustersState {
+  clusters: IndexableCluster[]
+  cluster?: IndexableCluster | undefined
+  cellId: string
+  region: string
+  view: AWSSupportedView.EKSClusters
+}
+
+export interface AnnotationsPayload {
+  annotations?: CellAnnotations
+  validationErrors?: CellAnnotationsErrorResult
+  id?: string
+}
+
 interface Payload {
   [OutputType.error]: string
   [OutputType.deno]?: DenoState
   [OutputType.vercel]: VercelState
   [OutputType.outputItems]: OutputItemsPayload
-  [OutputType.annotations]: {
-    annotations?: CellAnnotations
-    validationErrors?: CellAnnotationsErrorResult
-    id?: string
-  }
+  [OutputType.annotations]: AnnotationsPayload & { settings: Settings }
   [OutputType.terminal]: TerminalConfiguration & {
     ['runme.dev/id']: string
     content?: string
     initialRows?: number
-    enableShareButton: boolean
     isAutoSaveEnabled: boolean
+    isSessionOutputsEnabled: boolean
+    isPlatformAuthEnabled: boolean
+    isDaggerOutput: boolean
   }
   [OutputType.github]?: GitHubState
   [OutputType.stdout]: object
-  [OutputType.gcp]?: GcpGkeClusterState | GcpGkeClustersState | GcpGceVMInstancesState
+  [OutputType.gcp]?:
+    | GcpGkeClusterState
+    | GcpGkeClustersState
+    | GcpGceVMInstancesState
+    | GcpCloudRunServicesState
+    | GcpCloudRunRevisionsState
   [OutputType.aws]?: AWSState
+  [OutputType.dagger]?: DaggerState
 }
 
 export type ClientMessage<T extends ClientMessages> = T extends any
@@ -335,7 +439,6 @@ export interface ClientMessagePayload {
   [ClientMessages.onProgramClose]: {
     ['runme.dev/id']: string
     code: number | void
-    escalationButton: boolean
   }
   [ClientMessages.activeThemeChanged]: string
   [ClientMessages.openLink]: string
@@ -396,19 +499,6 @@ export interface ClientMessagePayload {
   [ClientMessages.platformApiResponse]: {
     data: any
     id: string
-    escalationButton: boolean
-    hasErrors?: boolean
-  }
-  [ClientMessages.cloudApiRequest]: {
-    data: any
-    id: string
-    hasErrors?: boolean
-    method: APIMethod
-  }
-  [ClientMessages.cloudApiResponse]: {
-    data: any
-    id: string
-    escalationButton: boolean
     hasErrors?: boolean
   }
   [ClientMessages.optionsModal]: {
@@ -494,6 +584,7 @@ export interface ClientMessagePayload {
   [ClientMessages.awsEC2InstanceAction]: {
     cellId: string
     instance: string
+    osUser: string
     region: string
     action: AWSActionType
   }
@@ -504,6 +595,60 @@ export interface ClientMessagePayload {
   [ClientMessages.gistCell]: {
     cellId: string
     telemetryEvent: string
+  }
+
+  [ClientMessages.gcpCloudRunAction]: {
+    cellId: string
+    resource?: string | undefined
+    project: string
+    resourceType?: 'revisions' | 'services'
+    region?: string
+    action: GCPCloudRunActionType
+  }
+
+  [ClientMessages.gcpLoadServices]: {
+    cellId: string
+    project: string
+  }
+
+  [ClientMessages.gcpServicesLoaded]: {
+    cellId: string
+    services?: GcpCloudRunService[] | undefined
+    region?: string | undefined
+    allRegionsLoaded: boolean
+    hasError: boolean
+    error?: string | undefined
+  }
+
+  [ClientMessages.awsEKSClusterAction]: {
+    cellId: string
+    cluster: string
+    region: string
+    action: AWSActionType
+  }
+
+  [ClientMessages.daggerSyncState]: {
+    id: string
+    cellId: string
+    text?: string
+    json?: any
+    state?: DaggerState
+  }
+
+  [ClientMessages.daggerCliAction]: {
+    cellId: string
+    command: string
+    argument?: string
+  }
+
+  [ClientMessages.featuresUpdateAction]: {
+    snapshot: string
+  }
+
+  [ClientMessages.featuresRequest]: {}
+
+  [ClientMessages.featuresResponse]: {
+    snapshot: string
   }
 }
 
@@ -560,6 +705,7 @@ export interface NotebookToolbarCommand {
 export enum APIMethod {
   CreateCellExecution = 'createCellExecution',
   UpdateCellExecution = 'updateCellExecution',
+  CreateEscalation = 'createEscalation',
 }
 
 export interface IApiMessage<T extends ClientMessage<ClientMessages>> {
@@ -585,3 +731,59 @@ export type NotebookUiEvent = {
   }
   ui: boolean
 }
+
+export type Settings = {
+  docsUrl?: string
+}
+
+export type FeatureContext = {
+  os?: string
+  vsCodeVersion?: string
+  runmeVersion?: string
+  extensionVersion?: string
+  githubAuth?: boolean // `true`, `false`, or `undefined`
+  statefulAuth?: boolean // `true`, `false`, or `undefined`
+  extensionId?: ExtensionName
+}
+
+export enum ExtensionName {
+  StatefulRunme = 'stateful.runme',
+  StatefulPlatform = 'stateful.platform',
+}
+
+export type EnabledForExtensions = Partial<Record<ExtensionName, boolean>>
+
+export type FeatureCondition = {
+  os?: string
+  vsCodeVersion?: string
+  runmeVersion?: string
+  extensionVersion?: string
+  githubAuthRequired?: boolean
+  statefulAuthRequired?: boolean
+  enabledForExtensions?: EnabledForExtensions
+}
+
+export enum FeatureName {
+  Gist = 'Gist',
+  Share = 'Share',
+  Escalate = 'Escalate',
+  ForceLogin = 'ForceLogin',
+  SignedIn = 'SignedIn',
+  RequireStatefulAuth = 'RequireStatefulAuth',
+  CopySelectionToClipboard = 'CopySelectionToClipboard',
+}
+
+export type Feature = {
+  enabled: boolean
+  on: boolean
+  conditions: FeatureCondition
+}
+
+export type Features = Partial<Record<keyof typeof FeatureName, Feature>>
+
+export type FeatureState = {
+  features: Features
+  context?: FeatureContext
+}
+
+export type FeatureObserver = BehaviorSubject<FeatureState>

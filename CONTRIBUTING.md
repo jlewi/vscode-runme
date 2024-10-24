@@ -100,7 +100,7 @@ $ cp -f "assets/$EXTENSION_BASENAME-icon.gif" "assets/icon.gif"
 $ cp -f "assets/$EXTENSION_BASENAME-logo-open-dark.svg" "assets/logo-open-dark.svg"
 $ cp -f "assets/$EXTENSION_BASENAME-logo-open-light.svg" "assets/logo-open-light.svg"
 $ cp -f "assets/$EXTENSION_BASENAME-logo-sidebar.svg" "assets/logo-sidebar.svg"
-$ npm install --include=dev
+$ NODE_OPTIONS='' npm install --include=dev
 ```
 
 Similarly a Runme WASM binary needs to be downloaded. If an error happened follow the error instructions and re-run the download, via:
@@ -122,6 +122,7 @@ cat .vscode/extensions.json | grep -v '\/\/' | jq -r ".recommendations[]" | xarg
 Then just run the watcher and you're off to the races.
 
 ```sh {"background":"true","id":"01HF7VQMH8ESX1EFV4PD922S8P","name":"npm-watch"}
+export NODE_OPTIONS="--import=./specifier-register.mjs --max-old-space-size=8192"
 npm run watch
 ```
 
@@ -135,25 +136,44 @@ If you want to run the extension against a specific runme kernel binary, you can
 }
 ```
 
+### Debug Project
+
+To run the extension in a new Extension Development Host window of VS Code open [src/extension/extension.ts](src/extension/extension.ts) inside VSCode, press `F5` or `Ctrl+Shift+D` and then select `Run Extension` from the dropdown.
+
 ### Build Project
 
 To compile all extension files, run:
 
-```sh {"id":"01HF7VQMH8ESX1EFV4PDNTDPTS","name":"build"}
+```sh {"id":"01HF7VQMH8ESX1EFV4PDNTDPTS","name":"build","promptEnv":"no"}
+export NODE_OPTIONS="--import=./specifier-register.mjs --max-old-space-size=8192"
 npm run build
+```
+
+And then package the extension into a .vsix file:
+
+```sh {"id":"01J04FQ8WSEVTDVS05VPZMKAYJ","name":"bundle","promptEnv":"no"}
+export NODE_OPTIONS="--import=./specifier-register.mjs --max-old-space-size=8192"
+npm run bundle
 ```
 
 ### Test Project
 
 The Runme project has several test stages that you can run individually or as a whole:
 
-```sh {"id":"01HF7VQMH8ESX1EFV4PFZ87Q58","name":"test"}
+```sh {"id":"01HF7VQMH8ESX1EFV4PFZ87Q58","name":"test","promptEnv":"no"}
+export NODE_OPTIONS="--import=./specifier-register.mjs --max-old-space-size=8192"
 npx runme run test:format test:lint test:unit test:e2e
+```
+
+```sh {"id":"01J5VPD3TXY1EAZDCXNHN60S77"}
+export NODE_OPTIONS="--import=./specifier-register.mjs --max-old-space-size=8192"
+npx runme run test:format test:lint test:unit
 ```
 
 When testing in CI environment, run:
 
-```sh {"id":"01HF7VQMH8ESX1EFV4PGJBDGG0","name":"test:ci"}
+```sh {"id":"01HF7VQMH8ESX1EFV4PGJBDGG0","name":"test:ci","promptEnv":"no"}
+export NODE_OPTIONS="--import=./specifier-register.mjs --max-old-space-size=8192"
 npx runme run test:format test:lint test:unit test:e2e:ci
 ```
 
@@ -182,15 +202,17 @@ npx eslint src tests --ext ts
 You can fix any linting errors via:
 
 ```sh {"id":"01HF7VQMH8ESX1EFV4PQ1YA4G5","name":"test:lint:fix"}
-eslint src tests --ext ts --fix
+npx eslint src tests --ext ts --fix
 ```
 
 #### Unit Testing
 
 We use [Vitest](https://vitest.dev/) for running unit tests via:
 
-```sh {"id":"01HF7VQMH8ESX1EFV4PT2KN303","name":"test:unit","promptEnv":"false"}
-export NODE_OPTIONS="--experimental-specifier-resolution=node"
+In case you experience a "Cannot find module '@buf/stateful'" error, it's probably caused because of a nvm cache issue, you can try clearing removing node_modules and reinstalling the dependencies. In case the issue persists, do a fresh clone of the repository. The issue is probably caused by nvm caching the wrong version of the package.
+
+```sh {"id":"01HF7VQMH8ESX1EFV4PT2KN303","name":"test:unit","promptEnv":"no"}
+export NODE_OPTIONS="--import=./specifier-register.mjs --max-old-space-size=8192"
 npx vitest -c ./vitest.conf.ts --run
 ```
 
@@ -205,6 +227,7 @@ open coverage/lcov-report/index.html
 We use WebdriverIO to run e2e tests on the VS Code extension:
 
 ```sh {"id":"01HF7VQMH8ESX1EFV4PX19FXW0","name":"test:e2e"}
+export NODE_OPTIONS="--import=./specifier-register.mjs --max-old-space-size=8192"
 npx wdio run ./tests/e2e/wdio.conf.ts
 ```
 
@@ -215,6 +238,7 @@ The process for testing in CI is a bit more complicated as we try to test closer
 Therefore to test in a closer production environment, run:
 
 ```sh {"id":"01HF7VQMH8ESX1EFV4PYWC0M3X","name":"test:e2e:ci"}
+export NODE_OPTIONS="--import=./specifier-register.mjs --max-old-space-size=8192"
 # run reconcile command when previous commands pass or fail
 npx runme run test:e2e:ci:setup test:e2e:ci:run; npx runme run test:e2e:ci:reconcile
 ```
@@ -228,7 +252,7 @@ mv ./node_modules/ ./.node_modules
 mv ./package.json ./.package.json
 mv ./package-lock.json ./.package-lock.json
 # then install runme again
-RUNME_DOWNLOAD_ON_INSTALL=1 npm i runme
+RUNME_DOWNLOAD_ON_INSTALL=1 NODE_OPTIONS='' npm i runme || true
 # restore package.json to allow testing the extension
 mv ./.package.json ./package.json
 ```
@@ -239,7 +263,7 @@ Then we can run the e2e tests via:
 
 ```sh {"id":"01HF7VQMH8ESX1EFV4Q3XXMMX7","name":"test:e2e:ci:run"}
 cd ./tests/e2e/
-npm ci
+NODE_OPTIONS='' npm ci
 npx wdio run ./wdio.conf.ts
 ```
 

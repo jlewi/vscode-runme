@@ -16,3 +16,5 @@ vscode-runme-CHANGELOG.txt
 .node_modules
 examples/.vscode
 assets
+.venv
+**/*-01*.md
